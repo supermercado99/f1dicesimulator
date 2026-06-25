@@ -792,7 +792,7 @@ const AUTOSAVE_KEY='f1dice_autosave_v8';
 const SLOT_NAMES=['Slot 1','Slot 2','Slot 3'];
 // Session lap limits and points are now in seasonRules() — no global constants
 // PQ thresholds now in seasonRules() — no global constants
-function AUTO_QUALIFY_CUTOFF_FOR_SEASON(){return seasonRules().autoQualCutoff||20;}
+function AUTO_QUALIFY_CUTOFF_FOR_SEASON(yr){return seasonRules(yr||undefined).autoQualCutoff||20;}
 const APP_VERSION='1.0.0';
 const DRIVER_MOD_CAP=6, TEAM_MOD_CAP=6;
 
@@ -809,8 +809,16 @@ function defaultApp(year){
   // Use whichever BASE_DRIVERS are currently loaded for initial modifier maps
   BASE_DRIVERS.forEach(d=>{dm[d.id]=0;});
   [...new Set(BASE_DRIVERS.map(d=>d.team))].forEach(t=>{tm[t]=0;});
-  // 1989: use fixed initial PQ list for R1-R8; 1991: use listOrder > autoQualCutoff
-  const defaultPreqIds=seasonRules(yr).initialPreqIds89||BASE_DRIVERS.filter(d=>d.listOrder>AUTO_QUALIFY_CUTOFF_FOR_SEASON(yr)).map(d=>d.id);
+  // 1989: use fixed initial PQ list; other seasons: derive from SEASONS contracted data
+  // (BASE_DRIVERS may still hold the previous season's data at this point)
+  const _getDefaultPqIds=(yr)=>{
+    const rls=seasonRules(yr);
+    if(rls.initialPreqIds89)return rls.initialPreqIds89;
+    const sd=SEASONS[yr];if(!sd)return[];
+    const cutoff=rls.autoQualCutoff||20;
+    return sd.contracted.slice(cutoff).map(e=>e[5]).filter(Boolean);
+  };
+  const defaultPreqIds=_getDefaultPqIds(yr);
   const defaultTeamSizes={};
   BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp).forEach(d=>{defaultTeamSizes[d.team]=(defaultTeamSizes[d.team]||0)+1;});
   return {history:{weekends:[]},currentWeekend:null,currentSeason:yr,driverModifiers:dm,teamModifiers:tm,driverInjuries:{},modHistory:{drivers:{},teams:{}},news:[],_pendingNews:null,preqDriverIds:[...defaultPreqIds],driverIncidents:{},_earlyCareerWinAwarded:{},_earlyCareerPodiumAwarded:{},_earlyCareerPtsAwarded:{},_inexperienceDrivers:{},_inexperienceTeams:{},_retiredDrivers:[],_teamChanges:[],_replacementDrivers:{},_seasonTeamsRaced:{},_initialTeams:[...new Set(BASE_DRIVERS.map(d=>d.team))],_initialTeamSizes:defaultTeamSizes,_activeContracts:{},_faCallupCount:{},_seasonFAPool:null,rivalries:{},_teammateHistory:{},realism:{realDrivers:false,realCalendar:false,realCircuits:false},_debugMessages:true,_movementRules:{injuries:true,suspensions:true,quitting:true,firing:true}};
@@ -840,7 +848,16 @@ function loadApp(){
     const validIds=new Set(BASE_DRIVERS.map(d=>d.id));
     const _defaultPqIds=()=>{
       const yr=s.currentSeason||1989;
-      return seasonRules(yr).initialPreqIds89||BASE_DRIVERS.filter(d=>d.listOrder>AUTO_QUALIFY_CUTOFF_FOR_SEASON(yr)).map(d=>d.id);
+      const rls=seasonRules(yr);
+      // 1989: use fixed PQ seat list
+      if(rls.initialPreqIds89) return rls.initialPreqIds89;
+      // For other seasons: derive from SEASONS contracted data (not BASE_DRIVERS,
+      // which may not be rebuilt yet at this point in loadApp)
+      const sd=SEASONS[yr];
+      if(!sd) return [];
+      const cutoff=rls.autoQualCutoff||20;
+      // contracted[i] has listOrder = i+1; PQ drivers are those with listOrder > cutoff
+      return sd.contracted.slice(cutoff).map(e=>e[5]).filter(Boolean);
     };
     if(!s.preqDriverIds||!s.preqDriverIds.length){
       s.preqDriverIds=_defaultPqIds();
@@ -1997,8 +2014,9 @@ function proceedToNewSeason(){
   app._earlyCareerWinAwarded={};
   app._earlyCareerPodiumAwarded={};
   app._earlyCareerPtsAwarded={};
-  // Reset preqDriverIds for new season using correct season rules
-  app.preqDriverIds=seasonRules().initialPreqIds89||BASE_DRIVERS.filter(d=>d.listOrder>AUTO_QUALIFY_CUTOFF_FOR_SEASON()).map(d=>d.id);
+  // Reset preqDriverIds for new season using correct season rules and contracted data
+  {const _rls=seasonRules();const _sd=SEASONS[app.currentSeason];const _co=_rls.autoQualCutoff||20;
+  app.preqDriverIds=_rls.initialPreqIds89||(_sd?_sd.contracted.slice(_co).map(e=>e[5]).filter(Boolean):BASE_DRIVERS.filter(d=>d.listOrder>_co).map(d=>d.id));}
 
   // 7. Build end-of-season news
   const endNews={
