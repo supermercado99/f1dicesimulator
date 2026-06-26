@@ -2685,10 +2685,9 @@ function markRetired(d,lap,roll,die){
   if(!d||d.status!=='active')return;
   d.status='retired';d.retirementReason=chooseRetirementReason(d,app.currentWeekend.rollSequence);
   d.incidentLap=lap;d.incidentRoll=roll;d.laps[lap-1]='X';
-  // In qualifying/pre-qualifying, only count half the retirement roll (round down)
+  // In qualifying/pre-qualifying, void the retirement lap score entirely (deduct the full roll)
   if(die&&app.currentWeekend.session!=='race'){
-    const deduct=Math.floor(die/2);
-    d.totalNumeric-=deduct;
+    d.totalNumeric-=die;
   }
   // Team mod for retirement; spun off driver mod (guarded)
   try{if(app.currentWeekend&&(d.base||d.team))applyRetirementTeamMod(d,app.currentWeekend.session);}catch(e){}
@@ -2702,10 +2701,9 @@ function markCrashed(d,lap,roll,die){
     if(!app.currentWeekend._crashedIds)app.currentWeekend._crashedIds=[];
     if(!app.currentWeekend._crashedIds.includes(d.id))app.currentWeekend._crashedIds.push(d.id);
   }
-  // In qualifying/pre-qualifying, only count half the retirement roll (round down)
+  // In qualifying/pre-qualifying, void the crash lap score entirely (deduct the full roll)
   if(die&&app.currentWeekend.session!=='race'){
-    const deduct=Math.floor(die/2);
-    d.totalNumeric-=deduct;
+    d.totalNumeric-=die;
   }
 }
 
