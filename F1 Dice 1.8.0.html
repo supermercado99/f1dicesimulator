@@ -2021,14 +2021,15 @@ const DRIVER_DATABASE=[
 // Get available free agents for a given season (from DB, eligible, not retired)
 function getSeasonFreeAgents(season){
   const retiredIds=new Set([
-    ...(app._retiredDrivers||[]).map(r=>r.id),  // permanent ID (dbKey was legacy)
-  ].filter(Boolean));
+    ...(app._retiredDrivers||[]).map(r=>r.id),
+    ...(app._retiredDrivers||[]).map(r=>r.pid).filter(x=>x!=null),
+  ].filter(x=>x!=null)); // keep 0 — it's a valid driver id, Boolean(0) would wrongly remove it
   // Use BOTH permanent IDs and dynamic IDs to exclude already-contracted drivers
   const usedIds=new Set([
-    ...BASE_DRIVERS.map(d=>d.id),
-    ...BASE_DRIVERS.map(d=>d.pid).filter(Boolean),
-    ...(app._seasonFAPool||[]).map(f=>f.id).filter(Boolean),  // already in FA pool
-    ...(app._seasonFAPool||[]).map(f=>f.pid).filter(Boolean),
+    ...BASE_DRIVERS.map(d=>d.id).filter(x=>x!=null),
+    ...BASE_DRIVERS.map(d=>d.pid).filter(x=>x!=null),
+    ...(app._seasonFAPool||[]).map(f=>f.id).filter(x=>x!=null),
+    ...(app._seasonFAPool||[]).map(f=>f.pid).filter(x=>x!=null),
   ]);
   return DRIVER_DATABASE.filter(d=>{
     if(!d.firstYear||d.firstYear>season)return false;
@@ -2036,7 +2037,7 @@ function getSeasonFreeAgents(season){
     // Exclude drivers with no generation modifier (e.g. Streiff — historical record only)
     if(d.db===null||d.db===undefined)return false;
     const pid=d.id; // DRIVER_DATABASE entries always have permanent IDs now (V5 data)
-    if(!pid)return false;
+    if(pid==null)return false; // null or undefined — not a valid id (but 0 is valid)
     if(retiredIds.has(pid)||retiredIds.has(d.ln))return false;
     if(usedIds.has(pid))return false;
     return true;
@@ -3960,29 +3961,87 @@ function evaluateAndFireDrivers(raceResults, newsItems){
     // Mechanical DNF = team fault not driver fault — no firing risk this race
     if(scoredThisRace||mechanicalThisRace)fireChance=0;
 
-    // DNQ multiplier — a sudden mid-season firing after failing to qualify. Kept rare by two
-    // things: it only fires at all for a driver whose form isn't positive (see the form-based
-    // suppression further below, which now protects any driver trending well regardless of
-    // points — a driver with neutral or negative form is not shielded just because he's scored
-    // before) and who just DNQ'd this specific race. On top of that, two factors shape how
-    // newsworthy the DNQ actually is: a weak team gets real leeway (their own car is plausibly
-    // to blame — as low as 0.2x), while a driver whose form was already trending negative is
-    // judged more harshly for the same result (up to ~2.2x). A mid-pack team (ttm≈+1) with
-    // neutral form is the roughly-1x baseline.
+    // ── Shock DNQ firing ─────────────────────────────────────────────────
+    // Fires only in the race where the driver DNQ'd, for auto-qual teams only.
+    // Not the same as the excess-DNQ multiplier below — this is a one-off 'angry reaction'
+    // by a team to an embarrassing surprise non-qualification.
+    if(!isPreq&&thisRaceDNQIds.has(d.id)){
+      // How many times has ANY driver at this team DNQ'd so far this season?
+      // First team DNQ is most shocking; probability drops with each subsequent one
+      // (a team that's already had two DNQs this year is less surprised by a third).
+      const _teamDNQsThisSeason=Object.keys(app._seasonDNQCount||{}).filter(sid=>{
+        const bd2=BASE_DRIVERS.find(x=>x.id===Number(sid));
+        return bd2&&teamCanonicalName(bd2.team)===teamCanonicalName(d.team);
+      }).reduce((sum,sid)=>(sum+(app._seasonDNQCount||{})[Number(sid)||sid]||0),0);
+      // Actually count preceding DNQs at this team (before this race's tally runs)
+      const _thisIsTeamsDNQN=Math.max(1,_teamDNQsThisSeason); // ≥1 since this driver just DNQ'd
+
+      // Exempt injury/suspension replacements (isReplacer), and permanent mid-season
+      // replacements for their first 3 entries
+      const _entriesAtTeam=roundsSinceTeamJoin(d.id,d.team,round);
+      const _joinInc=(app.driverIncidents?.[d.id]||[]).find(inc=>
+        inc.type==='teamJoin'&&inc.year===app.currentSeason&&(inc.details?.round||0)>0);
+      const _isPermanentMidSeasonReplacement=_joinInc&&!_joinInc.details?.isInjuryReplacement&&!_joinInc.details?.isSuspensionReplacement;
+      const _shockExempt=isReplacer||(_isPermanentMidSeasonReplacement&&_entriesAtTeam<=3);
+
+      if(!_shockExempt){
+        // Base probability: scales with team strength (good teams react more harshly to DNQs)
+        // and season progression (later in season = team is more stressed = more likely to act).
+        // Kept rare — even a top team angrily firing someone after one DNQ is an unusual story.
+        const _ttmForShock=(teamBaseTb(d.team)||0)+(getTeamMod(d.team)||0);
+        // Teams above +2.50 are 'top' teams who'd be very embarrassed by a DNQ
+        // Teams +0.01 to +2.49 have moderate reaction
+        // Teams at 0 or below are used to it — very low base
+        const _shockBase=_ttmForShock>=2.50?0.15:_ttmForShock>0?0.06:0.02;
+
+        // Driver vs team gap: a driver with modifier BELOW the team's level is more
+        // expendable — the team knows they have higher-calibre options available.
+        // A driver at or above the team's level gets significant protection.
+        const _driverMod=driverTotalMod(d.id);
+        const _modGap=_ttmForShock-_driverMod; // positive = driver is below team level
+        const _gapFactor=_modGap>0?Math.min(2.5,1+_modGap*0.5):Math.max(0.15,1+_modGap*0.3);
+
+        // Decays sharply with each prior team DNQ — first is most newsworthy, by the 3rd
+        // the team is used to it and won't fire impulsively (they'd have already acted or adapted)
+        const _shockDecay=Math.max(0.05,1/(_thisIsTeamsDNQN*1.5));
+
+        // Season progression: acts more decisively closer to the end of the season
+        const _seasonProg=Math.min(1,round/Math.max(1,_totalRoundsFire));
+        const _progFactor=0.6+_seasonProg*0.4;
+
+        // Championship protection: if driver is in top half of standings with points scored,
+        // team is less likely to fire someone performing well in the championship
+        const _champSt=seasonStandings(app.currentSeason);
+        const _champIdx=_champSt.drivers.findIndex(x=>x.id===d.id);
+        const _hasChampPoints=(_champSt.drivers[_champIdx]?.championshipPoints||0)>0;
+        const _numDrivers=_champSt.drivers.length||1;
+        const _champProtect=_hasChampPoints&&_champIdx>=0&&_champIdx<_numDrivers/2?0.4:1;
+
+        // Form: positive form protects (team sees recent good results, less trigger-happy)
+        const _shockFormFactor=_formForFire>0?0.4:_formForFire<-1?1.4:1;
+
+        const _shockProb=_shockBase*_gapFactor*_shockDecay*_progFactor*_champProtect*_shockFormFactor;
+
+        if(Math.random()<_shockProb){
+          toProcess.push({id:d.id,team:d.team,reason:'poor-qualifying',action:'fired'});
+          return;
+        }
+      }
+    }
+
+    // ── Excess DNQ multiplier ────────────────────────────────────────────
+    // Separate from shock firing: the existing accumulated-DNQ multiplier that boosts
+    // the general firing chance for a driver who has repeatedly DNQ'd this season.
+    // Applies alongside the normal fireChance evaluation below, not as an instant trigger.
     const _prevPQTeamsMS=new Set((app._pqTeamsBySeason?.[app.currentSeason-1]||[]).map(t=>teamCanonicalName(t)));
-    // Genuinely 'escaped PQ this season' = was in PQ last season AND is not in PQ now —
-    // not just 'absent from last season's PQ list', which is true for nearly every normal
-    // auto-qual team (most have never been in PQ at all) and was silently disabling this
-    // whole mechanic for almost the entire grid.
     const escapedPQThisSeason=_prevPQTeamsMS.has(teamCanonicalName(d.team))&&!isPreq;
     if(!isPreq&&!escapedPQThisSeason&&thisRaceDNQIds.has(d.id)){
       const dnqCount=(app._seasonDNQCount||{})[d.id]||0;
-      if(dnqCount>=1){
-        // Ensure base is non-zero so DNQ multiplier has something to multiply
+      if(dnqCount>=2){
         if(fireChance===0)fireChance=firingChance(round,isPreq,isReplacer,_ttmFire,isLowlyTeam,_totalRoundsFire);
         const _dnqTeamFactor=Math.max(0.2,Math.min(1.5,(_ttmFire+1)/2));
         const _dnqFormFactor=_formForFire<0?1+Math.min(-_formForFire,3)*0.4:1;
-        fireChance*=Math.min(2.4,1.1+(dnqCount-1)*0.5)*_dnqTeamFactor*_dnqFormFactor;
+        fireChance*=Math.min(2.4,1.0+(dnqCount-2)*0.5)*_dnqTeamFactor*_dnqFormFactor;
       }
     }
 
@@ -4059,9 +4118,11 @@ function evaluateAndFireDrivers(raceResults, newsItems){
     const dnqCount=(app._seasonDNQCount||{})[d.id]||0;
     const atFaultThisRace=thisRaceFaultIds.has(d.id);
     const seasonCrashFaultsForLabel=(app._seasonCrashFaultCount||{})[d.id]||0;
+    const dnqThisRace=!isPreq&&thisRaceDNQIds.has(d.id); // auto-qual driver who DNQ'd THIS race
     if(rivalFire) specificReason='rivalry';
     else if(seasonCrashFaultsForLabel+((app._seasonSpunOffCount||{})[d.id]||0)*0.5>=2) specificReason='reckless-driving';
-    else if(dnqCount>=1) specificReason='poor-qualifying';
+    else if(dnqThisRace&&dnqCount===1) specificReason='poor-qualifying'; // single DNQ this race — 'failed to qualify'
+    else if(dnqCount>=2) specificReason='reckless-driving'; // multiple DNQs → 'performance issues' (reuses reckless-driving map key for 'performance issues')
 
     if(Math.random()<fireChance){
       toProcess.push({id:d.id,team:d.team,reason:rivalFire?'rivalry':specificReason,action:'fired'});
@@ -4198,7 +4259,7 @@ function evaluateAndFireDrivers(raceResults, newsItems){
 
     if(f.action==='fired'&&f.reason==='rivalry'){
       const tm=BASE_DRIVERS.find(x=>x.team===team&&x.id!==d.id&&!x._temp);
-      if(tm){const rv=getRivalry(f.id,tm.id);if(rv){rv.pts=100;rv.hatred=true;}}
+      if(tm){const rv=getRivalry(f.id,tm.id);if(rv){rv.pts=100;rv.hatred=true;rv._wasHatred=true;}}
     }
 
     // Modifier hit for losing a driver mid-season — team takes a hit either way (fired or
@@ -4219,6 +4280,10 @@ function evaluateAndFireDrivers(raceResults, newsItems){
     // Always find a replacement (teams must stay at their starting driver count).
     // Prefer signing an established driver away from a weaker rival team; fall back
     // to the free-agent pool if no signing happens.
+    // Find teammate for rivalry-reason entries (needed to show "rivalry with [name]" in news)
+    const _rivalTeammate=f.reason==='rivalry'?BASE_DRIVERS.find(x=>x.team===team&&x.id!==d.id&&!x._temp):null;
+    const _rivalTeammateName=_rivalTeammate?driverFullName(_rivalTeammate):null;
+
     if(!app.currentWeekend._firedNews)app.currentWeekend._firedNews=[];
     if(!app.currentWeekend._recentReplacementIds)app.currentWeekend._recentReplacementIds=new Set();
     const _existingTeamIds=BASE_DRIVERS.filter(d=>d.team===team&&!d._temp&&!d._retired).map(d=>d.id);
@@ -4275,6 +4340,7 @@ function evaluateAndFireDrivers(raceResults, newsItems){
         nation2: d.nation2||'',
         signedFromTeam: donorTeam,
         viaPromotion: !!signing.viaPromotion,
+        rivalTeammateName: _rivalTeammateName,
       };
       const rivalPts=Math.floor(Math.random()*26);
       if(rivalPts>0) addRivalryPoints(f.id,poachedDriver.id,rivalPts,f.action==='fired'?'Fired and replaced':'Replaced after quitting',newsItems);
@@ -4304,7 +4370,8 @@ function evaluateAndFireDrivers(raceResults, newsItems){
           originalName: fullName||name,
           replacementName: replFullName,
           replacementNation2: repl.nation2||repl.n2||'',
-          nation2: d.nation2||''
+          nation2: d.nation2||'',
+          rivalTeammateName: _rivalTeammateName,
         });
         // Rivalry points between departing driver and replacement
         const rivalPts=Math.floor(Math.random()*26);
@@ -4492,9 +4559,13 @@ function addRivalryPoints(idA,idB,delta,reason,newsItems){
 
   r.pts=Math.max(0,Math.min(100,r.pts+delta));
 
-  // Lock hatred permanently
-  if(oldLevel==='Hatred'||r.pts>=75)r.hatred=true;
-  if(r.hatred)r.pts=Math.max(75,r.pts); // floor at 75 once hatred
+  // Hatred is no longer a permanent lock — it can decay back down over time (see
+  // decayRivalries), but a rivalry that was EVER hatred can never fall below Tension (25).
+  // _wasHatred is the permanent marker; r.hatred reflects CURRENT status and is
+  // recalculated every time, not locked on once true.
+  if(oldLevel==='Hatred'||r.pts>=75)r._wasHatred=true;
+  if(r._wasHatred)r.pts=Math.max(25,r.pts); // ex-hatred floor — can fade, never below Tension
+  r.hatred=r.pts>=75;
 
   const newLevel=r.hatred?'Hatred':rivalryLevel(r.pts);
   const _findDriver=id=>BASE_DRIVERS.find(d=>d.id===id)||(app._seasonFAPool||[]).find(d=>d.id===id)||FREE_AGENTS.find(d=>d.id===id)||DRIVER_DATABASE.find(d=>d.id===id)||getHistoryRaceFlat().find(r=>r.id===id);
@@ -4514,7 +4585,9 @@ function addRivalryPoints(idA,idB,delta,reason,newsItems){
     // Log rivalry start as a driver incident for both drivers
     recordDriverIncident(idA,'rivalryStart',{otherId:idB,reason,year,round});
     recordDriverIncident(idB,'rivalryStart',{otherId:idA,reason,year,round});
-    if(newLevel&&newsItems)newsItems.push(`⚔ <strong>New rivalry:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} — <span style="color:${rivalryColour(newLevel)}">${newLevel}</span> (${escapeHtml(reason)})`);
+    // Starting at Tension specifically isn't very newsworthy on its own — only announce a
+    // brand-new rivalry if it opens straight at Dislike or Hatred.
+    if(newLevel&&newLevel!=='Tension'&&newsItems)newsItems.push(`⚔ <strong>New rivalry:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} — <span style="color:${rivalryColour(newLevel)}">${newLevel}</span> (${escapeHtml(reason)})`);
   }
   // Level changed — only if the rivalry already existed before this call and not started this same round
   else if(!wasNew&&oldLevel&&newLevel&&oldLevel!==newLevel){
@@ -4523,14 +4596,17 @@ function addRivalryPoints(idA,idB,delta,reason,newsItems){
       const levelOrder={Tension:1,Dislike:2,Hatred:3};
       const rising=(levelOrder[newLevel]||0)>(levelOrder[oldLevel]||0);
       const verb=rising?'Rivalry escalates':'Rivalry cools';
-      if(newsItems)newsItems.push(`⚔ <strong>${verb}:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} ${oldLevel} → <span style="color:${rivalryColour(newLevel)}">${newLevel}</span>`);
+      // Ending up exactly at Tension isn't newsworthy either way — whether cooling down
+      // into it from Dislike/Hatred, or (in principle) rising into it. Escalating OUT of
+      // Tension into Dislike/Hatred is unaffected, since newLevel isn't Tension there.
+      if(newLevel!=='Tension'&&newsItems)newsItems.push(`⚔ <strong>${verb}:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} ${oldLevel} → <span style="color:${rivalryColour(newLevel)}">${newLevel}</span>`);
     }
   }
   // Rivalry ended (dropped below 25, not hatred) — but not within 2 rounds of starting
   const tooNew=r.started&&r.started.year===year&&(round-r.started.round)<2;
   if(oldLevel&&!newLevel&&!r.hatred&&!tooNew){
     r.ended={year,round};
-    if(newsItems)newsItems.push(`⚔ <strong>Rivalry ends:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)}.`);
+    // 'Rivalry ends' suppressed — a rivalry fading away is not notable news
   }
 }
 
@@ -4538,8 +4614,11 @@ function decayRivalries(newsItems){
   if(!app.rivalries)return;
   Object.keys(app.rivalries).forEach(key=>{
     const r=app.rivalries[key];
-    if(r.hatred)return; // Hatred never decays
     if(r.pts<=0)return;
+    // Ex-hatred rivalries can decay too now, just never below the Tension floor (handled
+    // inside addRivalryPoints via _wasHatred) — no point rolling decay for one already
+    // sitting exactly at that floor with nothing left to lose.
+    if(r._wasHatred&&r.pts<=25)return;
     const decay=Math.floor(Math.random()*3)+1; // 1-3
     const [a,b]=key.split(':').map(Number);
     addRivalryPoints(a,b,-decay,'Natural decay',newsItems);
@@ -4804,16 +4883,18 @@ function addTeamRivalryPoints(teamA,teamB,delta,reason,newsItems){
   const wasNew=!oldLevel&&!!newLevel;
   if(wasNew){
     r.started={year,round,reason};r.ended=null;
-    if(newsItems)newsItems.push(`⚔ <strong>New team rivalry:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} — <span style="color:${rivalryColour(newLevel)}">${newLevel}</span> (${escapeHtml(reason)})`);
+    // Don't report a new rivalry starting at Tension level — not newsworthy
+    if(newsItems&&newLevel!=='Tension')newsItems.push(`⚔ <strong>New team rivalry:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} — <span style="color:${rivalryColour(newLevel)}">${newLevel}</span> (${escapeHtml(reason)})`);
   } else if(!wasNew&&oldLevel&&newLevel&&oldLevel!==newLevel){
     const rising=r.pts>oldPts;
     const verb=rising?'Team rivalry escalates':'Team rivalry cools';
-    if(newsItems)newsItems.push(`⚔ <strong>${verb}:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} ${oldLevel} → <span style="color:${rivalryColour(newLevel)}">${newLevel}</span>`);
+    // Don't report changes that land at Tension (too minor to announce)
+    if(newsItems&&newLevel!=='Tension')newsItems.push(`⚔ <strong>${verb}:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)} ${oldLevel} → <span style="color:${rivalryColour(newLevel)}">${newLevel}</span>`);
   }
   const tooNew=r.started&&r.started.year===year&&(round-r.started.round)<2;
   if(oldLevel&&!newLevel&&!tooNew){
     r.ended={year,round};
-    if(newsItems)newsItems.push(`⚔ <strong>Team rivalry ends:</strong> ${escapeHtml(nameA)} vs ${escapeHtml(nameB)}.`);
+    // 'Team rivalry ends' suppressed — a team rivalry fading away is not notable news
   }
   // Track hatred-tier crossings specifically, separate from general tier start/end —
   // used to keep the team career log focused on hatred only, not every tier change.
@@ -4949,9 +5030,13 @@ function _relationRejoinBlockChance(driverId,team){
 }
 function findReplacement(team, excludeIds, permanent){
   initSeasonFAPool();
+  const _retiredIds=new Set((app._retiredDrivers||[]).map(r=>r.id));
   const pool=(app._seasonFAPool||[]).filter(fa=>{
     if(excludeIds.includes(fa.id))return false;
     if(!faEligible(fa.id))return false;
+    // Never return a retired or pending-retired driver as a replacement candidate
+    if(fa._retired||fa._pendingRetirement)return false;
+    if(_retiredIds.has(fa.id))return false;
     // Cannot return to a team they were fired/quit from earlier this season
     if((app._seasonTeamBlocklist?.[fa.id]||[]).includes(teamCanonicalName(team)))return false;
     // Hidden reluctance to rejoin a team the relationship with is currently poor
@@ -4996,6 +5081,14 @@ function findReplacement(team, excludeIds, permanent){
 }
 
 function hireReplacement(fa, team, racesLeft, replacingId){
+  // Never hire a driver who has already retired or is pending retirement this EOS cycle
+  if(fa._retired)return;
+  if(fa._pendingRetirement)return;
+  if((app._retiredDrivers||[]).some(r=>r.id===fa.id))return;
+  // Reset mech DNF count when joining a new team — frustration should only reflect
+  // the current team's reliability record, not carry over from a previous team.
+  if(app._seasonMechDNFCount&&fa.id!=null)app._seasonMechDNFCount[fa.id]=0;
+  if(app._lastMechDNFRound&&fa.id!=null)delete app._lastMechDNFRound[fa.id];
   if(!app._faCallupCount)app._faCallupCount={};
   // Only count against the 2-team temporary limit for genuine temp contracts.
   // Permanent season hires (racesLeft===999) are not temporary and don't use a temp slot.
@@ -5593,13 +5686,46 @@ function buildSeasonEndSummary(season, retireNews, moveNews, storyNews, newSeaso
   const st=seasonStandings(season);
   const dChamp=st.driverChampion||st.drivers[0]?.name||'—';
   const cChamp=st.teamChampion||st.teams[0]?.name||'—';
-  const leftItems=[...(retireNews||[]).map(n=>`<li>${n}</li>`),...(storyNews||[]).map(n=>`<li>${n}</li>`)];
-  const rightItems=(moveNews||[]).map(n=>`<li>${n}</li>`);
   const sections=[];
+
   sections.push(`<h4>🏆 ${season} World Champions</h4><p style="font-size:14px">Drivers: <strong>${escapeHtml(dChamp)}</strong> &nbsp;|&nbsp; Constructors: <strong>${escapeHtml(cChamp)}</strong></p>`);
+
+  // Left column: driver news
+  // Retirements first
+  const retItems=(retireNews||[]).map(n=>`<li style="margin-bottom:3px">${n}</li>`);
+  // Off-season driver storylines — split boosts (+) from penalties/random (-)
+  const driverStory=(storyNews||[]).filter(n=>!n.startsWith('<strong>')||n.includes('modifier-')); // driver rows only (team rows start differently)
+  // storyNews has already-mixed driver and team items; filter driver-looking ones
+  // (team items come first in storyNews, driver items are individual driver links)
+  // We rely on _pendingNews for the proper split; fall back to showing all in one bucket
+  const pn=app._pendingNews||{};
+  const driverBoosts=(pn.driverStorylines||[]).filter(s=>s.includes('modifier-pos'));
+  const driverRandom=(pn.driverStorylines||[]).filter(s=>!s.includes('modifier-pos'));
+
+  let leftHtml='';
+  if(retItems.length)leftHtml+=`<h4 style="margin-top:0">⛔ Retirements</h4><ul style="margin:0 0 12px;padding-left:20px">${retItems.join('')}</ul>`;
+  if(driverBoosts.length)leftHtml+=`<h4>📈 Driver boosts</h4><ul style="margin:0 0 12px;padding-left:20px">${driverBoosts.map(n=>`<li style="margin-bottom:3px">${n}</li>`).join('')}</ul>`;
+  if(driverRandom.length)leftHtml+=`<h4>📉 Off-season changes</h4><ul style="margin:0 0 12px;padding-left:20px">${driverRandom.map(n=>`<li style="margin-bottom:3px">${n}</li>`).join('')}</ul>`;
+  if(!leftHtml)leftHtml='<p class="subtle" style="font-size:13px">No driver news this off-season.</p>';
+
+  // Right column: team modifier changes sorted by total modifier descending
+  const teamMods=pn.teamMods||[];
+  let rightHtml='';
+  if(teamMods.length){
+    rightHtml+=`<h4 style="margin-top:0">🏎 Team modifier changes</h4>`;
+    teamMods.forEach(t=>{
+      const modStr=(t.totalMod>=0?'+':'')+t.totalMod.toFixed(2);
+      const link=teamLink(t.canon,escapeHtml(t.name),true);
+      const changesHtml=t.entries.map(e=>`<span class="${e.delta>=0?'modifier-pos':'modifier-neg'}">${e.delta>=0?'+':''}${e.delta.toFixed(2)}</span> ${escapeHtml(e.reason)}`).join('<br>&nbsp;&nbsp;&nbsp;');
+      rightHtml+=`<div style="margin-bottom:8px;font-size:12px"><strong>${link}</strong> <span class="${t.totalMod>=0?'modifier-pos':'modifier-neg'}" style="font-size:11px">${modStr}</span><br><span style="color:var(--muted)">&nbsp;&nbsp;&nbsp;${changesHtml}</span></div>`;
+    });
+  } else {
+    rightHtml='<p class="subtle" style="font-size:13px">No team modifier changes this off-season.</p>';
+  }
+
   sections.push(`<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:12px;align-items:start">
-    <div><h4 style="margin-top:0">Retirements &amp; off-season changes</h4>${leftItems.length?`<ul style="margin:0;padding-left:20px">${leftItems.join('')}</ul>`:'<p class="subtle" style="font-size:13px">None.</p>'}</div>
-    <div><h4 style="margin-top:0">Driver movements</h4>${rightItems.length?`<ul style="margin:0;padding-left:20px">${rightItems.join('')}</ul>`:'<p class="subtle" style="font-size:13px">None.</p>'}</div>
+    <div>${leftHtml}</div>
+    <div>${rightHtml}</div>
   </div>`);
   sections.push(`<p style="font-size:13px;margin-top:12px"><em>Press "Proceed to ${newSeason}" to begin the new season.</em></p>`);
   return sections.join('');
@@ -5720,7 +5846,7 @@ function eosInitState(){
     stage:0,stagesDone:new Set(),year:yr,nextYear:yr+1,
     settings:{overrideRetirements:true,allowRandomTeams:false},
     gridRules,
-    retirements:[],retConfirmed:false,
+    retirements:[],retConfirmed:false,_retirementsRolled:false,
     entrantsConfirmed:false,
     confirmedNewTeams:[],
     _nextPQTeams:null,  // computed after Stage 3 confirms
@@ -5728,7 +5854,7 @@ function eosInitState(){
     _debugMode:false,
     closures:[],renames:[],closuresConfirmed:false,
     movements:null,movementsConfirmed:false,_movementsPhase:'voluntary',
-    _phase1:null,_phase2:null,_phase3:null,
+    _phase1:null,_phase3:null,
     signings:null,rosterConfirmed:false,_revealedSignings:0,
     processLog:[],_standingsCache:st,
   };
@@ -5759,7 +5885,7 @@ function eosNextStage(){
   renderEndOfSeason();
 }
 
-const EOS_STAGES=['Settings','Retirements','New Entrants','Team Changes','Driver Movements','Free Agent Signings','Complete'];
+const EOS_STAGES=['Settings','New Entrants','Team Changes','Driver Movements','Free Agent Signings','Complete'];
 
 function eosReadOnlyWrap(content,isDone){
   return isDone?`<div style="opacity:0.7;pointer-events:none">${content}</div>`:content;
@@ -5812,7 +5938,16 @@ window.eosSaveSettings=function(){
 
 // ── Stage 1: Retirements ───────────────────────────────────────────
 function eosComputeRetirements(){
-  const eos=app._eos;if(!eos||eos.retConfirmed)return;
+  const eos=app._eos;if(!eos||eos.retConfirmed||eos._retirementsRolled)return;
+  // Guard against re-rolling: this function is called defensively from several render
+  // paths (eosRenderMovements, eosComputeMovements, eos_advancePhase, the debug full-EoS
+  // runner) every time they execute, not just once. Without a dedicated 'already rolled'
+  // flag, calling it a second time before eos.retConfirmed is set would wipe eos.retirements
+  // and re-roll every voluntary (Math.random()-based) retirement from scratch — silently
+  // changing which drivers are retiring after the player has already seen the list, and
+  // leaking the originally-shown retirees back into the free-agent pool since they're no
+  // longer in the (re-rolled) eos.retirements array used everywhere else to exclude them.
+  eos._retirementsRolled=true;
   eos.retirements=[];
   const yr=eos.year,nyr=eos.nextYear;
 
@@ -5831,7 +5966,7 @@ function eosComputeRetirements(){
   app._activeContracts={};
   app._replacementDrivers={};
 
-  BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp).forEach(d=>{
+  BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp&&!d._pendingRetirement).forEach(d=>{
     const forced=d._careerEndingInjury||(nyr-d.dob>=45);
     if(forced){eos.retirements.push({d,forced:true,override:false,reason:d._careerEndingInjury?'Career-ending injury':`Age ${nyr-d.dob} — mandatory retirement`});return;}
     const prob=eosAdjRetProb(d.dob,nyr,d.id);
@@ -5873,8 +6008,12 @@ function eosComputeRetirements(){
     const _ageThisSeason=nyr-dob;
     let prob=eosAdjRetProb(dob,nyr,fa.id);
     if(!enteredRace){
-      // Base zero-entry penalty: +5% for any age, +10% for over 40
-      const _zeroBase=_ageThisSeason>40?0.10:0.05;
+      // Base zero-entry penalty: +1% under 30 (a driver that young without a drive is still
+      // hopeful, not retiring — this keeps them well under the 5% roll threshold so one bad
+      // season doesn't matter, and without compounding at this age it never builds into a
+      // real risk purely from repeated low rolls over a long game), +5% for 30-40, +10% for
+      // over 40.
+      const _zeroBase=_ageThisSeason>40?0.10:_ageThisSeason>=30?0.05:0.01;
       // Compounding: each additional year without a GP entry adds another 10% over 40
       // Track via _yearsWithoutEntry on the FA object
       const _yearsOut=(fa._yearsWithoutEntry||0)+1;
@@ -5899,14 +6038,6 @@ function eosComputeRetirements(){
     }
   });
 }
-function eosBuildRetProbTable(){
-  const yr=app._eos?.nextYear||1992;
-  return BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp&&!d._careerEndingInjury).map(d=>{
-    const age=yr-d.dob;
-    const adj=eosAdjRetProb(d.dob,yr,d.id);
-    return{html:`<tr><td>${flagImg(d.nation2)} ${escapeHtml(driverFullName(d))}</td><td>${age}</td><td><b style="color:${adj>=0.18?'#dc2626':adj>=0.08?'#92400e':'inherit'}">${(adj*100).toFixed(1)}%</b></td><td style="font-size:11px;color:var(--muted)">Age ${age}</td></tr>`,adj};
-  }).filter(r=>r.adj>=0.05).sort((a,b)=>b.adj-a.adj).map(r=>r.html).join('');
-}
 function eosRenderRetirements(){
   const eos=app._eos;const isDone=eos.stagesDone.has(1);
   const hasRolled=eos.retirements.length>0||eos.retConfirmed;
@@ -5919,10 +6050,8 @@ function eosRenderRetirements(){
     .sort((a,b)=>(qualifiesForCareerRetrospective(driverCareer(b.r.d.id).stats)?1:0)-(qualifiesForCareerRetrospective(driverCareer(a.r.d.id).stats)?1:0));
   const canOverride=eos.settings.overrideRetirements&&!isDone;
   let body='';
-  const probTable=`<div class="sec" style="margin-top:12px">Retirement probability (≥5% shown, ordered by risk)</div>
-    <div class="panel" style="overflow:visible"><div class="table-wrap" style="max-height:none;overflow:visible"><table class="small-table"><thead><tr><th>Driver</th><th>Age</th><th>Probability</th><th></th></tr></thead><tbody>${eosBuildRetProbTable()}</tbody></table></div></div>`;
   if(!hasRolled&&!isDone){
-    body=probTable;
+    body='';
   } else {
     if(!eos.retirements.length)body='<div class="session-banner" style="background:#f0fdf4;border-color:#86efac;color:#166534;cursor:default">No retirements this off-season.</div>';
     if(forced.length)body+=`<div class="sec">Mandatory (${forced.length})</div>
@@ -5955,15 +6084,14 @@ function eosRenderRetirements(){
           ${canOverride?`<button class="ghost" style="font-size:12px;padding:3px 10px" onclick="eosToggleRetOverride(${origI})">${r.override?'Allow retirement':'Keep active'}</button>`:''}
         </div></div></div>`;
       }).join('')}`;
-    body+=probTable; // show probability table below results
   }
   return eosReadOnlyWrap(`
-  <div class="eos-header"><div class="eos-tag">Stage 1 of 6</div><h2>Driver Retirements</h2>
+  <div class="eos-header"><div class="eos-tag">Stage 4 of 5</div><h2>Driver Retirements (no longer standalone)</h2>
   </div>
   <div class="btn-row">
     ${isDone?'<span class="tag" style="background:#dcfce7;color:#166534;padding:6px 12px">✓ Confirmed</span>':hasRolled?`
     <button class="btn" onclick="eosConfirmRetirements()">Confirm →</button>
-    <button class="ghost" onclick="app._eos.retirements=[];app._eos.processLog=app._eos.processLog.filter(e=>!e.includes('[S1]'));renderEndOfSeason()">↺ Re-roll</button>`
+    <button class="ghost" onclick="app._eos.retirements=[];app._eos._retirementsRolled=false;app._eos.processLog=app._eos.processLog.filter(e=>!e.includes('[S1]'));renderEndOfSeason()">↺ Re-roll</button>`
     :`<button class="btn" onclick="eosComputeRetirements();renderEndOfSeason()">🎲 Simulate retirements</button>`}
   </div>
   ${body}`,isDone);
@@ -5976,6 +6104,13 @@ window.eosConfirmRetirements=function(){
   eos.retConfirmed=true;
   eos.retirements.filter(r=>!r.override).forEach(r=>{
     eosLog(`RETIRED: ${driverFullName(r.d)||r.d.name} (${r.reason})`,1);
+    // Immediately mark the driver as retiring so subsequent re-renders/re-entries to the
+    // EOS wizard don't re-add them as mandatory retirement candidates. The actual
+    // executeCareerEndingInjury call (which splices them from BASE_DRIVERS, adds to
+    // _retiredDrivers, etc.) still happens in eosApplyAndBeginNewSeason later — this
+    // flag just prevents the eosComputeRetirements loop from seeing them as 'active'.
+    const bd=BASE_DRIVERS.find(x=>x.id===r.d.id);
+    if(bd)bd._pendingRetirement=true;
   });
   eosNextStage();
 };
@@ -6006,7 +6141,7 @@ function eosRenderEntrants(){
   const eos=app._eos;const isDone=eos.stagesDone.has(2);
   const newEntrants=eosGetNewEntrants();
   return eosReadOnlyWrap(`
-  <div class="eos-header"><div class="eos-tag">Stage 2 of 6</div><h2>New Season Entrants</h2>
+  <div class="eos-header"><div class="eos-tag">Stage 2 of 5</div><h2>New Season Entrants</h2>
     <p style="color:var(--muted);font-size:13px">Drivers with firstYear=${eos.nextYear} who will be eligible for the available pool next season.</p></div>
   <div class="btn-row">
     ${isDone?'<span class="tag" style="background:#dcfce7;color:#166534;padding:6px 12px">✓ Confirmed</span>':`<button class="btn" onclick="eosConfirmEntrants()">Confirm →</button>`}
@@ -6113,7 +6248,7 @@ function eosGetRenames(){
   return renames;
 }
 function eosRenderTeamChanges(){
-  const eos=app._eos;const isDone=eos.stagesDone.has(3);
+  const eos=app._eos;const isDone=eos.stagesDone.has(2);
   const renames=eosGetRenames();
   const existingTeamNames=new Set(BASE_DRIVERS.filter(d=>d.team&&d.team!=='Available'&&!d._retired).map(d=>d.team));
   // New teams from TEAMS_DATABASE for nextYear
@@ -6136,7 +6271,7 @@ function eosRenderTeamChanges(){
   const _mx=gr.maxTeams||20;const _tg=gr.targetTeams||18;
   const _closureNote=allNewTeams.length?(_t2>_mx?` — <strong style="color:#dc2626">${_t2-_mx} must close</strong> (max ${_mx} teams)`:_t2===_mx?' — at maximum; optional roll to close 1 more':' — no closures needed'):'';
   return eosReadOnlyWrap(`
-  <div class="eos-header"><div class="eos-tag">Stage 3 of 6</div><h2>Team Changes</h2>
+  <div class="eos-header"><div class="eos-tag">Stage 3 of 5</div><h2>Team Changes</h2>
     <p style="color:var(--muted);font-size:13px">${gr.label||''} rules: ${gr.minTeams}–${gr.maxTeams} teams, ${gr.minDrivers}–${gr.maxDrivers} drivers target. Currently ${existingTeamNames.size} active teams${allNewTeams.length?` + ${allNewTeams.length} joining = <strong>${_t2} total</strong>${_closureNote}`:''}.</p></div>
   <div class="btn-row">
     ${isDone?'<span class="tag" style="background:#dcfce7;color:#166534;padding:6px 12px">✓ Confirmed</span>':(()=>{
@@ -6300,7 +6435,7 @@ function eosComputeNextPQTeams(){
 window.eosConfirmTeamChanges=function(){
   try{
   const eos=app._eos;
-  if(!eos||eos.stagesDone.has(3))return;
+  if(!eos||eos.stagesDone.has(2))return;
   eos.closures.forEach(t=>{
     eosLog(`CLOSED: ${t}`,3);
     // Immediately release closed team drivers to FA pool so they can be picked up this EoS
@@ -6326,11 +6461,14 @@ window.eosConfirmTeamChanges=function(){
   }catch(e){console.error('eosConfirmTeamChanges error:',e);alert('Error confirming team changes: '+e.message);}
 };
 
-// ── Stage 4: Driver Movements — four sequential phases ─────────────────────
+// ── Stage 4: Driver Movements — two sequential phases ───────────────────────
 // Each phase is lazy-computed ONLY AFTER the previous phase is confirmed by user.
-// Phase state in eos._movementsPhase: 'voluntary'→'recruited'→'releases'→done
-// Data: eos._phase1/2/3 = {computed,items:[{d,from,to,type,reason,approved}]}
-// eos.movements = combined Phase1+Phase2+Phase3 (for downstream compatibility)
+// Phase state in eos._movementsPhase: 'voluntary'→'releases'→done
+// Data: eos._phase1/3 = {computed,items:[{d,from,to,type,reason,approved}]}
+// eos.movements = combined Phase1+Phase3 (for downstream compatibility). Recruiting now
+// happens together with free-agent signing in Stage 5, not as a separate phase here —
+// this way a driver released to make room for a recruit has already had their own fair
+// shot at being recruited before the process moves on to pure leftover free agents.
 
 function _eosApproved(items){return items.filter(m=>m.approved!==false);}
 
@@ -6353,7 +6491,10 @@ function eosComputePhase1Voluntary(){
   if(!eos||eos._phase1?.computed)return;
   const items=[];
   const closedTeams=new Set(eos.closures);
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
+  // Include BOTH runtime ids AND pids — FREE_AGENTS entries use pid, BASE_DRIVERS use
+  // the runtime id assigned at game start. A mismatch means a retiring driver's pid
+  // can pass the !retiringIds.has(fid) check in rawFreeAgents, leaking them into the pool.
+  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).flatMap(r=>[r.d.id,r.d.pid].filter(x=>x!=null)));
   const recruitedAwayIds=new Set(); // Phase 2 not yet computed — hatred check uses teammate currently present
   const activeDrivers=BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)&&!closedTeams.has(d.team));
   const alreadyMovingIds=new Set();
@@ -6377,7 +6518,7 @@ function eosComputePhase1Voluntary(){
       const rKey=[Math.min(d.id,hatredTeammate.id),Math.max(d.id,hatredTeammate.id)].join(':');
       if(!app.rivalries)app.rivalries={};
       if(!app.rivalries[rKey])app.rivalries[rKey]={pts:0,hatred:false};
-      app.rivalries[rKey].pts=100;app.rivalries[rKey].hatred=true;app.rivalries[rKey]._permanent=true;
+      app.rivalries[rKey].pts=100;app.rivalries[rKey].hatred=true;app.rivalries[rKey]._wasHatred=true;
       items.push({d,from:team,to:null,type:'leave',approved:null,reason:`Negative teammate relationship (${escapeHtml(driverFullName(hatredTeammate)||'teammate')})`});
       alreadyMovingIds.add(d.id);alreadyMovingIds.add(hatredTeammate.id);return;
     }
@@ -6397,6 +6538,29 @@ function eosComputePhase1Voluntary(){
       const _rvEOS=getRivalry(d.id,_dislikeTeammateEOS.id);
       if(_rvEOS&&!_rvEOS.hatred&&_rvEOS.pts>0)_dislikeFactorEOS=1+(_rvEOS.pts/100)*3;
     }
+    // Team-performance frustration: the team's modifier has declined meaningfully across
+    // the season, and/or the car has repeatedly failed under this driver mechanically —
+    // a driver watching the operation go backwards can choose to walk. Only applies when
+    // the driver is performing at or above the team's own level (a driver who's part of the
+    // problem doesn't get to be 'frustrated' with it), and never to a driver on a genuinely
+    // strong team (still a good seat regardless of trajectory).
+    const _teamCanonFrust=teamCanonicalName(team);
+    const _teamStartMod=(app._seasonStartTeamMod||{})[_teamCanonFrust];
+    const _teamDrop=_teamStartMod!=null?_teamStartMod-ttm:0;
+    const _mechCount=(app._seasonMechDNFCount||{})[d.id]||0;
+    if(dtm>=ttm&&ttm<1.5){
+      let _frustChance=0;
+      if(_teamDrop>=0.5)_frustChance+=Math.min(0.20,(_teamDrop-0.5)*0.10+0.06);
+      if(_mechCount>=3)_frustChance+=Math.min(0.15,(_mechCount-2)*0.05);
+      if(_frustChance>0&&Math.random()<_frustChance){
+        const _frustReason=_teamDrop>=0.5&&_mechCount>=3
+          ?`Frustrated with team decline (-${_teamDrop.toFixed(2)} this season, ${_mechCount} mechanical DNFs)`
+          :_teamDrop>=0.5?`Frustrated with team decline (-${_teamDrop.toFixed(2)} this season)`
+          :`Frustrated with car reliability (${_mechCount} mechanical DNFs)`;
+        items.push({d,from:team,to:null,type:'leave',approved:null,reason:_frustReason});
+        alreadyMovingIds.add(d.id);return;
+      }
+    }
     if(Math.random()<0.08*_champBonus*_loyaltyBonus*_dislikeFactorEOS){
       items.push({d,from:team,to:null,type:'leave',approved:null,reason:'Voluntary departure'});
       alreadyMovingIds.add(d.id);return;
@@ -6413,113 +6577,33 @@ function eosComputePhase1Voluntary(){
   eos._phase1={computed:true,items};
 }
 
-function eosComputePhase2Recruitment(){
-  const eos=app._eos;
-  if(!eos||eos._phase2?.computed)return;
-  const items=[];
-  const closedTeams=new Set(eos.closures);
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
-  const phase1LeavingIds=new Set(_eosApproved(eos._phase1.items).map(m=>m.d.id));
-  const activeDrivers=BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)&&!closedTeams.has(d.team)&&!phase1LeavingIds.has(d.id));
-  const teamTtm=t=>(teamBaseTb(t)||0)+(getTeamMod(t)||0);
-  const driverDtm=d=>driverTotalMod(d.id);
-  const activeTeams=[...new Set(activeDrivers.map(d=>d.team))].sort((a,b)=>teamTtm(b)-teamTtm(a));
-  const recruitedIds=new Set();
-  activeTeams.forEach(targetTeam=>{
-    const ttm=teamTtm(targetTeam);
-    const isPreq=(app.preqDriverIds||[]).some(pid=>BASE_DRIVERS.find(b=>b.id===pid)?.team===targetTeam);
-    if(isPreq)return;
-    if(Math.random()>Math.max(0.10,0.55+ttm*0.05))return;
-    const candidates=activeDrivers.filter(d=>{
-      if(d.team===targetTeam||recruitedIds.has(d.id))return false;
-      const srcIsPreq=(app.preqDriverIds||[]).some(pid=>BASE_DRIVERS.find(b=>b.id===pid)?.team===d.team);
-      if(srcIsPreq)return false;
-      const dtm=driverDtm(d);
-      // Still needs to be a credible, worthwhile talent — not actively underperforming.
-      // No requirement here that the move be a strict upgrade (that's handled as a strong
-      // WEIGHTING preference below, not a hard filter) — previously this instead required
-      // the candidate's OWN modifier to exceed the RECRUITING team's modifier by 0.5-3.0,
-      // which became nearly impossible once a team was already strong (a +2.75 team needed
-      // a driver rated 3.25+, essentially unreachable) while trivially easy for a weak team —
-      // systematically pulling talent DOWN the grid instead of up.
-      if(dtm<0)return false;
-      // Elite drivers (+2.50 and above) are biased away from joining a team with a negative
-      // modifier — a >5-point gap (e.g. a +4.88 driver joining a -0.44 team) reads as an
-      // implausible mismatch rather than a credible underdog story. Mostly excluded, not
-      // absolutely impossible — a rare surprise signing can still happen.
-      if(dtm>=2.5&&ttm<0&&Math.random()<0.90)return false;
-      if(activeDrivers.filter(x=>x.team===targetTeam).some(td=>isRivalryBlocked(d.id,td.id)))return false;
-      // Tenure loyalty: a top driver early in a successful spell at their current team is
-      // much harder to poach away — 'doing well and the team wants them' shouldn't churn
-      // just because another team could technically offer a marginally higher fit.
-      const srcTtm=teamTtm(d.team);
-      const srcTenure=driverTenureAtTeam(d.id,d.team,eos.year||app.currentSeason);
-      if(dtm>=3.0&&srcTenure<2&&(srcTtm-dtm)<1.0&&Math.random()<0.70)return false;
-      return true;
-    });
-    if(!candidates.length)return;
-    // Rank primarily by how much of a step up this represents for the driver (target team
-    // stronger than their current one) — this is what makes the phase primarily about teams
-    // improving themselves — blended with the driver's own quality, so a strong driver can
-    // still occasionally rank highly enough for an underdog/lateral move rather than upgrades
-    // being an absolute requirement. Downgrade amount is floored so a severe downgrade isn't
-    // impossible, just heavily discouraged.
-    const pick=pickWeightedByForm(candidates,c=>{
-      const upgradeAmount=ttm-teamTtm(c.team);
-      return driverDtm(c)+Math.max(-1.5,upgradeAmount)*3;
-    });
-    if(pick){
-      items.push({d:pick,from:pick.team,to:targetTeam,type:'upgrade',approved:null,
-        reason:`Recruited by ${escapeHtml(teamDisplayName(targetTeam))} (team ${ttm.toFixed(2)}, driver ${driverDtm(pick).toFixed(2)})`});
-      recruitedIds.add(pick.id);
-    }
-  });
-  eos._phase2={computed:true,items};
-}
 
 function eosComputePhase3Releases(){
   const eos=app._eos;
-  if(!eos||eos._phase3?.computed||!eos._phase2?.computed)return;
+  if(!eos||eos._phase3?.computed)return;
   const items=[];
   const closedTeams=new Set(eos.closures);
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
+  // Include BOTH runtime ids AND pids — FREE_AGENTS entries use pid, BASE_DRIVERS use
+  // the runtime id assigned at game start. A mismatch means a retiring driver's pid
+  // can pass the !retiringIds.has(fid) check in rawFreeAgents, leaking them into the pool.
+  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).flatMap(r=>[r.d.id,r.d.pid].filter(x=>x!=null)));
   const phase1LeavingIds=new Set(_eosApproved(eos._phase1.items).map(m=>m.d.id));
-  const recruitedIds=new Set(_eosApproved(eos._phase2.items).map(m=>m.d.id));
-  const recruitedTo=new Map(_eosApproved(eos._phase2.items).map(m=>[m.d.id,m.to]));
   const teamTtm=t=>(teamBaseTb(t)||0)+(getTeamMod(t)||0);
   const driverDtm=d=>driverTotalMod(d.id);
   const activeDrivers=BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)&&!closedTeams.has(d.team));
   const alreadyReleasedIds=new Set();
 
   // Reputation-penalized drivers (see applyReputationPenaltyAfterLastRace) are almost
-  // certain to be released here, unless they already left voluntarily in Phase 1 or got
-  // poached by another team in Phase 2 — a driver whose season reputation collapsed at a
-  // top team essentially never survives at that team into the next season on their own.
+  // certain to be released here, unless they already left voluntarily in Phase 1 — a driver
+  // whose season reputation collapsed at a top team essentially never survives at that team
+  // into the next season on their own.
   (app._repPenalizedIds||[]).forEach(id=>{
-    if(phase1LeavingIds.has(id)||recruitedIds.has(id)||alreadyReleasedIds.has(id))return;
+    if(phase1LeavingIds.has(id)||alreadyReleasedIds.has(id))return;
     const d=activeDrivers.find(x=>x.id===id);
     if(!d)return;
     if(Math.random()<0.90){
       items.push({d,from:d.team,to:null,type:'release',approved:null,reason:'Reputation collapsed after underperforming a top team drive'});
       alreadyReleasedIds.add(id);
-    }
-  });
-
-  // Over-cap releases: only needed when incoming recruits push team over maxS
-  const activeTeams=[...new Set(activeDrivers.map(d=>d.team))];
-  activeTeams.forEach(team=>{
-    const staying=activeDrivers.filter(d=>d.team===team&&!phase1LeavingIds.has(d.id)&&(!recruitedIds.has(d.id)||recruitedTo.get(d.id)===team));
-    const incoming=activeDrivers.filter(d=>d.team!==team&&recruitedIds.has(d.id)&&recruitedTo.get(d.id)===team);
-    // Only fire for over-cap if there are actual incoming recruits — never fire existing drivers
-    // on behalf of a recruit that doesn't exist
-    if(!incoming.length)return;
-    const roster=[...staying,...incoming];
-    const maxS=isOneDriverTeam(team,eos.nextYear)?1:2;
-    if(roster.length<=maxS)return;
-    const releasable=roster.filter(d=>!recruitedIds.has(d.id)).sort((a,b)=>driverDtm(a)-driverDtm(b));
-    for(let i=0;i<Math.min(roster.length-maxS,releasable.length);i++){
-      items.push({d:releasable[i],from:team,to:null,type:'release',approved:null,reason:`Released to make room for recruit`});
-      alreadyReleasedIds.add(releasable[i].id);
     }
   });
 
@@ -6539,7 +6623,7 @@ function eosComputePhase3Releases(){
     });
   }
 
-  activeDrivers.filter(d=>!phase1LeavingIds.has(d.id)&&!recruitedIds.has(d.id)&&!releasedInPhase1.has(d.id)).forEach(d=>{
+  activeDrivers.filter(d=>!phase1LeavingIds.has(d.id)&&!releasedInPhase1.has(d.id)).forEach(d=>{
     const dtm=driverDtm(d);
     const isPreq=(app.preqDriverIds||[]).some(id=>id===d.id)||(app.preqDriverIds||[]).some(pid=>BASE_DRIVERS.find(b=>b.id===pid)?.team===d.team);
     // A driver's season-cumulative DNQ/DNPQ/crash counts can include rounds spent at a
@@ -6557,11 +6641,10 @@ function eosComputePhase3Releases(){
         releasedInPhase1.add(d.id);return;
       }
     }
-    // DNPQ firing: mirrors DNQ firing above, but for drivers actually in the PQ pool who
-    // regularly fail to advance from pre-qualifying — closing the gap where a driver could
-    // DNPQ race after race with no consequence at all, unlike an auto-qualifier who DNQs.
+    // DNPQ firing: higher threshold than DNQ (55% vs 40%) — failing to pre-qualify is more
+    // expected at the PQ level; it takes sustained failure before a firing is justified.
     const dnpqCount=(app._seasonDNPQCount||{})[d.id]||0;
-    const dnpqThreshold=Math.max(2,Math.ceil(0.4*seasonRules().totalRounds));
+    const dnpqThreshold=Math.max(3,Math.ceil(0.55*seasonRules().totalRounds));
     if(_establishedForRelease&&isPreq&&dnpqCount>=dnpqThreshold&&!releasedInPhase1.has(d.id)){
       const prob=Math.min(0.80,((dnpqCount-dnpqThreshold+1)/dnpqThreshold)*0.50+0.30);
       if(Math.random()<prob){
@@ -6581,73 +6664,45 @@ function eosComputePhase3Releases(){
       }
     }
   });
-  activeDrivers.filter(d=>!phase1LeavingIds.has(d.id)&&!recruitedIds.has(d.id)&&!releasedInPhase1.has(d.id)).forEach(d=>{
-    const team=d.team;const dtm=driverDtm(d);const ttm=teamTtm(team);
-    const isPreq=(app.preqDriverIds||[]).some(id=>id===d.id)||(app.preqDriverIds||[]).some(pid=>BASE_DRIVERS.find(b=>b.id===pid)?.team===team);
-    const _formEOS=driverFormScore(d.id);
-    // Exclude newly recruited drivers from 'below teammate' check — recruitment is done, and
-    // drivers who ended the season with the team shouldn't be penalised for an incoming star
-    const stayingTeammates=activeDrivers.filter(x=>x.team===team&&x.id!==d.id&&!phase1LeavingIds.has(x.id)&&!releasedInPhase1.has(x.id)&&!recruitedIds.has(x.id));
-    const bestMod=stayingTeammates.length?Math.max(...stayingTeammates.map(x=>driverDtm(x))):-99;
-    const tml=stayingTeammates.length===0&&activeDrivers.some(x=>x.team===team&&x.id!==d.id&&phase1LeavingIds.has(x.id));
-    // Below teammate: exempt if very good form; less likely if good form; MORE likely if
-    // poor/very poor form — a driver trending down is a real signal on top of their raw
-    // modifier standing, not just an offsetting factor for improving drivers.
-    const teammateProbMult=_formEOS>1.5?0:_formEOS>=0.5?0.4:_formEOS<=-1.5?1.6:_formEOS<=-0.5?1.25:1.0;
-    // Same 'credible second driver' protection as below-team-level: a positive modifier PLUS
-    // positive current form makes a driver a believable second driver even well behind a
-    // stronger teammate, not obviously a mismatch.
-    const _secondDriverProtectionTM=(dtm>0&&_formEOS>0)?0.5:1;
-    if(teammateProbMult>0&&!tml&&stayingTeammates.length&&bestMod-dtm>1.2&&Math.random()<0.55*teammateProbMult*_secondDriverProtectionTM&&!releasedInPhase1.has(d.id)){
-      items.push({d,from:team,to:null,type:'release',approved:null,reason:`Below teammate by ${(bestMod-dtm).toFixed(2)}`});
-      releasedInPhase1.add(d.id);return;
-    }
-    const relThresh=isPreq?0.8:1.2;const relProb=isPreq?0.60:0.45;
-    const negT=ttm<0?3.0:relThresh;const highT=ttm>=3.0?2.0:relThresh;
-    const effThresh=Math.max(relThresh,negT,highT);
-    // Exempt drivers with total modifier ≥ +2.50 from below-team-level releases (high-modifier
-    // drivers are franchise assets regardless of relative standing) — UNLESS their form has
-    // collapsed into 'very poor': a prolonged nosedive puts even a franchise player at risk,
-    // regardless of this or any other protection.
-    const _veryPoorFormEOS=_formEOS<-1.5;
-    if(dtm>=2.50&&!_veryPoorFormEOS)return;
-    // Below team level: exempt if very good form; less likely if good form; MORE likely if
-    // poor/very poor form (out of form) this season.
-    const teamLevelProbMult=_formEOS>1.5?0:_formEOS>=0.5?0.4:_formEOS<=-1.5?1.6:_formEOS<=-0.5?1.25:1.0;
-    // A driver with BOTH a positive modifier and positive current form gets extra leeway to
-    // stay even when well below the team's level — a modest-but-solid, in-form driver
-    // (e.g. +0.24 at a +2.75 team) is a believable 'second driver' next to a stronger
-    // teammate, not obviously a mismatch the way a negative-modifier or out-of-form driver
-    // in the same seat would be.
-    const _secondDriverProtection=(dtm>0&&_formEOS>0)?0.5:1;
-    if(teamLevelProbMult>0&&(dtm<3.0||_veryPoorFormEOS)&&ttm-dtm>effThresh&&Math.random()<relProb*teamLevelProbMult*_secondDriverProtection&&!releasedInPhase1.has(d.id)){
-      items.push({d,from:team,to:null,type:'release',approved:null,reason:_veryPoorFormEOS?`Prolonged loss of form (${_formEOS.toFixed(2)})`:`Below team level (driver ${dtm.toFixed(2)} vs team ${ttm.toFixed(2)})`});
-      releasedInPhase1.add(d.id);
-    }
-  });
+  // NOTE: 'Below teammate' and 'Below team level' are deliberately NOT release reasons any
+  // more — those comparisons now live inside the unified retention decision in
+  // eosComputeSignings (see the own-driver weighting in pickForTeam), where a team weighs
+  // whether to re-sign its own driver against the actual alternatives available. The outcome
+  // for a driver who loses that comparison is 'not retained — squad moved on', decided with
+  // full knowledge of who else was actually available, rather than a speculative release
+  // into the void beforehand.
   eos._phase3={computed:true,items};
 }
 
 function eosComputeMovements(){
-  // Legacy shim: computes all three phases at once (used by auto-advance path)
+  // Legacy shim: computes both phases at once (used by auto-advance path)
   const eos=app._eos;if(!eos||eos.movements!==null)return;
+  // Retirements must be computed and _pendingRetirement set BEFORE Phase1 Voluntary,
+  // so that retiring drivers are excluded from the voluntary departure roll.
+  if(!eos.retConfirmed){
+    eosComputeRetirements();
+    eos.retirements.filter(r=>!r.override).forEach(r=>{
+      const bd=BASE_DRIVERS.find(x=>x.id===r.d.id);
+      if(bd)bd._pendingRetirement=true;
+    });
+    eos.retConfirmed=true;
+  }
   eosComputePhase1Voluntary();
   (eos._phase1?.items||[]).filter(m=>m.approved===null).forEach(m=>m.approved=true);
-  eosComputePhase2Recruitment();
-  (eos._phase2?.items||[]).filter(m=>m.approved===null).forEach(m=>m.approved=true);
   eosComputePhase3Releases();
   (eos._phase3?.items||[]).filter(m=>m.approved===null).forEach(m=>m.approved=true);
-  eos.movements=[...(eos._phase1?.items||[]),...(eos._phase2?.items||[]),...(eos._phase3?.items||[])];
+  eos.movements=[...(eos._phase1?.items||[]),...(eos._phase3?.items||[])];
 }
 
 function eosRenderMovements(){
-  const eos=app._eos;const isDone=eos.stagesDone.has(4);
-  const phase=eos._movementsPhase||'voluntary';
-  if(phase==='voluntary'&&!eos._phase1?.computed)eosComputePhase1Voluntary();
-  if(phase==='voluntary'&&!eos._phase1?.computed)eosComputePhase1Voluntary(); // double-call guard
-  if(phase==='recruited'&&!eos._phase2?.computed)eosComputePhase2Recruitment();
-  if(phase==='releases'&&!eos._phase3?.computed)eosComputePhase3Releases();
-  const p1=eos._phase1?.items||[];const p2=eos._phase2?.items||[];const p3=eos._phase3?.items||[];
+  const eos=app._eos;const isDone=eos.stagesDone.has(3);
+  // Retirements are rolled and confirmed here rather than as a separate stage.
+  if(!eos.retConfirmed){eosComputeRetirements();}
+  // Both departure phases compute together and display on ONE page.
+  if(!eos._phase1?.computed)eosComputePhase1Voluntary();
+  if(!eos._phase3?.computed)eosComputePhase3Releases();
+  const p1=eos._phase1?.items||[];const p3=eos._phase3?.items||[];
+  const retItems=(eos.retirements||[]).filter(r=>!r.override);
 
   function mvRow(mv,phaseActive){
     const isApp=mv.approved===true,isRej=mv.approved===false;
@@ -6656,64 +6711,63 @@ function eosRenderMovements(){
     const toLabel=mv.to?`→ <strong>${escapeHtml(teamDisplayName(mv.to))}</strong>`:`→ Available pool`;
     const bd=BASE_DRIVERS.find(x=>x.id===mv.d.id);
     const dName=bd?driverFullName(bd):(mv.d.name||'?');
-    const allItems=[...p1,...p2,...p3];const globalIdx=allItems.indexOf(mv);
+    const allItems=[...p1,...p3];const globalIdx=allItems.indexOf(mv);
     return`<div class="panel" style="margin-bottom:6px"><div style="display:flex;justify-content:space-between;align-items:flex-start">
       <div><strong>${flagImg(mv.d.nation2||'')} ${escapeHtml(dName)}</strong> <span class="tag" style="${typeStyle};font-size:10px">${typeLabel}</span>
       <div style="font-size:12px;color:var(--muted)">${escapeHtml(teamDisplayName(mv.from||'?'))} ${toLabel}</div>
       <div style="font-size:11px;color:#f59e0b">${escapeHtml(mv.reason)}</div></div>
     </div></div>`;
   }
+  function retRow(r){
+    const dName=driverFullName(r.d)||r.d.name||'?';
+    const _retStats=driverCareer(r.d.id)?.stats;
+    const _isNotable=qualifiesForCareerRetrospective(_retStats);
+    const _highlight=_retStats
+      ?`${_retStats.entries} entries · ${_retStats.starts} starts · ${_retStats.wins} win${_retStats.wins!==1?'s':''} · ${_retStats.championshipPoints} pts · ${_retStats.championshipWins} title${_retStats.championshipWins!==1?'s':''}`
+      :'';
+    return`<div class="panel" style="margin-bottom:6px;${_isNotable?'border-left:3px solid #f59e0b;padding-left:8px':''}">
+      <strong>${flagImg(r.d.nation2||r.d.n2||'')} ${escapeHtml(dName)}</strong>${_isNotable?' ⭐':''}
+      <div style="font-size:12px;color:var(--muted)">Retired · ${escapeHtml(r.reason||'')}</div>
+      ${_highlight?`<div style="font-size:11px;color:#92400e">${escapeHtml(_highlight)}</div>`:''}
+    </div>`;
+  }
 
-  const phaseInfo={
-    voluntary:{desc:'Drivers choosing to leave their teams, including those who quit due to hatred rivalries with teammates.',btn:'→ Compute Recruitment'},
-    recruited:{desc:'Teams pursue better drivers based on vacancies from Phase 1. Recruited drivers cannot be released in Phase 3.',btn:'→ Compute Releases'},
-    releases:{desc:'Teams release underperforming drivers: over-cap after recruitment, too many DNQs, too many at-fault crashes, below teammate, or below team level.',btn:'→ Free Agent Signings'},
-  };
-  const curInfo=phaseInfo[phase];
-  const phaseOrderFull=['voluntary','recruited','releases'];
-  const curPhaseIdx=phaseOrderFull.indexOf(phase);
   const colInfo=[
-    {key:'voluntary',title:'Voluntary Departures',items:p1,idx:0},
-    {key:'recruited',title:'Recruited',items:p2,idx:1},
-    {key:'releases',title:'Released',items:p3,idx:2},
+    {key:'retired',title:'Retirements',items:retItems,render:retRow},
+    {key:'voluntary',title:'Voluntary Departures',items:p1,render:mvRow},
+    {key:'releases',title:'Released',items:p3,render:mvRow},
   ];
   const phaseHtml=`<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:start">
     ${colInfo.map(col=>{
-      const reached=isDone||col.idx<=curPhaseIdx;
-      const isCurrentCol=!isDone&&col.idx===curPhaseIdx;
-      if(!reached){
-        return`<div><div class="sec" style="margin-top:0;opacity:0.5">${col.title} — not yet computed</div><div style="font-size:13px;color:var(--muted)">—</div></div>`;
-      }
-      const confirmedTag=(!isDone&&col.idx<curPhaseIdx)?' <span class="tag" style="background:#dcfce7;color:#166534;font-size:10px">✓ Confirmed</span>':'';
-      return`<div style="${isCurrentCol?'border-left:3px solid var(--accent);padding-left:8px':''}"><div class="sec" style="margin-top:0">${col.title} (${col.items.length})${confirmedTag}</div>${col.items.length?col.items.map(mv=>mvRow(mv,isCurrentCol)).join(''):'<div style="font-size:13px;color:var(--muted)">None.</div>'}</div>`;
+      return`<div><div class="sec" style="margin-top:0">${col.title} (${col.items.length})</div>${col.items.length?col.items.map(x=>col.render(x)).join(''):'<div style="font-size:13px;color:var(--muted)">None.</div>'}</div>`;
     }).join('')}
   </div>`;
 
   return eosReadOnlyWrap(`
-  <div class="eos-header"><div class="eos-tag">Stage 4 of 6</div><h2>Driver Movements</h2>
-    ${!isDone&&curInfo?`<p style="color:var(--muted);font-size:13px">${curInfo.desc}</p>`:''}
+  <div class="eos-header"><div class="eos-tag">Stage 4 of 5</div><h2>Driver Movements</h2>
+    ${!isDone?`<p style="color:var(--muted);font-size:13px">Retirements, drivers choosing to leave (rivalries, team-performance frustration), and disciplinary releases (DNQs/DNPQs, at-fault crashes, collapsed reputation).</p>`:''}
   </div>
   <div class="btn-row">
-    ${isDone?'<span class="tag" style="background:#dcfce7;color:#166534;padding:6px 12px">✓ All phases confirmed</span>':`
-    <button class="btn" onclick="eos_advancePhase()">${curInfo?.btn||'Continue →'}</button>`}
+    ${isDone?'<span class="tag" style="background:#dcfce7;color:#166534;padding:6px 12px">✓ Confirmed</span>':`
+    <button class="btn" onclick="eos_advancePhase()">→ Recruiting & Free Agent Signings</button>`}
   </div>
   ${phaseHtml}
-  ${!isDone&&phaseHtml.length>200?`<div class="btn-row" style="margin-top:12px"><button class="btn" onclick="eos_advancePhase()">${curInfo?.btn||'Continue →'}</button></div>`:''}
+  ${!isDone&&phaseHtml.length>200?`<div class="btn-row" style="margin-top:12px"><button class="btn" onclick="eos_advancePhase()">→ Recruiting & Free Agent Signings</button></div>`:''}
   `,isDone);
 }
 window.eos_approveAllPhase=function(){
   const eos=app._eos;const phase=eos._movementsPhase||'voluntary';
-  const items=phase==='voluntary'?eos._phase1?.items:phase==='recruited'?eos._phase2?.items:eos._phase3?.items;
+  const items=phase==='voluntary'?eos._phase1?.items:eos._phase3?.items;
   (items||[]).forEach(m=>m.approved=true);renderEndOfSeason();
 };
 window.eos_rejectAllPhase=function(){
   const eos=app._eos;const phase=eos._movementsPhase||'voluntary';
-  const items=phase==='voluntary'?eos._phase1?.items:phase==='recruited'?eos._phase2?.items:eos._phase3?.items;
+  const items=phase==='voluntary'?eos._phase1?.items:eos._phase3?.items;
   (items||[]).forEach(m=>m.approved=false);renderEndOfSeason();
 };
 window.eos_mvSetPhase=function(globalIdx,v){
   const eos=app._eos;if(!eos)return;
-  const allItems=[...(eos._phase1?.items||[]),...(eos._phase2?.items||[]),...(eos._phase3?.items||[])];
+  const allItems=[...(eos._phase1?.items||[]),...(eos._phase3?.items||[])];
   if(allItems[globalIdx])allItems[globalIdx].approved=v;renderEndOfSeason();
 };
 window.eos_mvSet=window.eos_mvSetPhase;
@@ -6721,18 +6775,28 @@ window.eos_approveAll=window.eos_approveAllPhase;
 window.eos_rejectAll=window.eos_rejectAllPhase;
 window.eos_advancePhase=function(){
   const eos=app._eos;if(!eos)return;
-  const phase=eos._movementsPhase||'voluntary';
-  const curItems=phase==='voluntary'?eos._phase1?.items:phase==='recruited'?eos._phase2?.items:eos._phase3?.items;
-  (curItems||[]).filter(m=>m.approved===null).forEach(m=>m.approved=true);
-  const next={voluntary:'recruited',recruited:'releases',releases:'done'}[phase];
-  if(next==='done'){
-    eos.movements=[...(eos._phase1?.items||[]),...(eos._phase2?.items||[]),...(eos._phase3?.items||[])];
-    eosConfirmMovements();
-  } else {eos._movementsPhase=next;renderEndOfSeason();}
+  // Ensure retirements have been computed — eosRenderMovements calls eosComputeRetirements()
+  // but if the player somehow advances without rendering first, compute it now defensively.
+  if(!eos.retConfirmed){
+    eosComputeRetirements();
+    // Mark ALL retiring drivers as pending (forced mandatory + voluntary) so eosComputePhase1
+    // and eosComputeSignings both see them as inactive.
+    eos.retirements.filter(r=>!r.override).forEach(r=>{
+      const bd=BASE_DRIVERS.find(x=>x.id===r.d.id);
+      if(bd)bd._pendingRetirement=true;
+    });
+    eos.retConfirmed=true;
+  }
+  // Ensure both movement phases have been computed before confirming
+  if(!eos._phase1?.computed)eosComputePhase1Voluntary();
+  if(!eos._phase3?.computed)eosComputePhase3Releases();
+  [...(eos._phase1?.items||[]),...(eos._phase3?.items||[])].filter(m=>m.approved===null).forEach(m=>m.approved=true);
+  eos.movements=[...(eos._phase1?.items||[]),...(eos._phase3?.items||[])];
+  eosConfirmMovements();
 };
 window.eosConfirmMovements=function(){
   const eos=app._eos;
-  if(!eos.movements)eos.movements=[...(eos._phase1?.items||[]),...(eos._phase2?.items||[]),...(eos._phase3?.items||[])];
+  if(!eos.movements)eos.movements=[...(eos._phase1?.items||[]),...(eos._phase3?.items||[])];
   (eos.movements||[]).filter(m=>m.approved!==false).forEach(mv=>{
     const bd=BASE_DRIVERS.find(x=>x.id===mv.d.id);
     if(bd)bd._eosMovement={type:mv.type,to:mv.to||null,from:mv.from};
@@ -6745,6 +6809,25 @@ window.eosConfirmMovements=function(){
     // version of 'given a chance at a bigger team' for the destination.
     if(mv.type==='release'){
       if(mv.from)applyDriverTeamRelation(mv.d.id,mv.from,-10,'Released at end of season');
+      // Performance-related releases (DNQ firings, DNPQ firings, crash firings) carry a
+      // modifier penalty — the driver is being let go for underperformance, which affects
+      // their reputation and negotiating position. Voluntary departures and 'not retained'
+      // (squad moved on) carry no penalty — those aren't reflections of underperformance.
+      const _isPerformanceRelease=mv._firedForDNQ||mv._firedForDNPQ||mv._firedForCrash;
+      if(_isPerformanceRelease){
+        const _eosYear=eos.year||app.currentSeason;
+        const _totalRoundsEoS=seasonRules(_eosYear).totalRounds||16;
+        // Scale -0.25 base by season length so it's consistent across eras
+        const _basePen=-0.25*(_totalRoundsEoS/16);
+        // Reduce penalty slightly if the driver actually scored championship points this
+        // season — they weren't completely useless, the team had a specific performance issue
+        const _st=seasonStandings(_eosYear);
+        const _dPts=(_st.drivers||[]).find(x=>x.id===mv.d.id)?.championshipPoints||0;
+        const _ptsMitigator=_dPts>0?0.5:1.0; // half penalty if they scored
+        const _pen=Math.round(_basePen*_ptsMitigator*100)/100;
+        const _penReason=mv._firedForDNQ?'Released — too many DNQs':mv._firedForDNPQ?'Released — too many DNPQs':'Released — at-fault crashes';
+        applyDriverModEndOfSeason(mv.d.id,_pen,_penReason);
+      }
     } else if(mv.type==='upgrade'){
       if(mv.from)applyDriverTeamRelation(mv.d.id,mv.from,-6,'Moved to a stronger team at end of season');
       if(mv.to)applyDriverTeamRelation(mv.d.id,mv.to,8,'Given a chance at a bigger team');
@@ -6791,7 +6874,10 @@ function eosComputeSignings(){
   // having chosen their actual team over the other(s) that also wanted them.
   const driverConsideredByTeams={};
 
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
+  // Include BOTH runtime ids AND pids — FREE_AGENTS entries use pid, BASE_DRIVERS use
+  // the runtime id assigned at game start. A mismatch means a retiring driver's pid
+  // can pass the !retiringIds.has(fid) check in rawFreeAgents, leaking them into the pool.
+  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).flatMap(r=>[r.d.id,r.d.pid].filter(x=>x!=null)));
   const closedTeams=new Set(eos.closures);
   const movedDrivers=new Map();
   (eos.movements||[]).filter(m=>m.approved!==false).forEach(m=>movedDrivers.set(m.d.id,{type:m.type,to:m.to}));
@@ -6801,7 +6887,14 @@ function eosComputeSignings(){
   const newTeamNames=(eos.confirmedNewTeams||[]).filter(t=>!closedTeams.has(t)&&!existingActiveTeams.includes(t));
   const activeTeams=[...existingActiveTeams,...newTeamNames];
 
-  // Calculate seats per team after retirements + movements
+  // Calculate seats per team after retirements + movements. Seats start fully OPEN for
+  // every team (not pre-filled by 'staying' drivers) — a team's own continuing drivers are
+  // now just one candidate among many in the unified pool below (see buildOwnDriverPool),
+  // competing on the same terms as free agents and recruits from other teams. This is what
+  // lets 'sign someone better, let the old driver go' emerge naturally from the normal
+  // weighting (relationship/tenure bias toward keeping them, eroded by a modifier drop or
+  // poor form, outweighed if a genuinely better option wins the pick) instead of needing a
+  // team to speculatively decide to release someone before it even knows who's available.
   const teamSeats={};
   activeTeams.forEach(t=>{
     if(newTeamNames.includes(t)){
@@ -6811,12 +6904,9 @@ function eosComputeSignings(){
       const maxS=2; // always field 2 drivers
       teamSeats[t]={count:0,max:maxS,isNew:true,isPQ:true,genMod:td?.genMod||0};return;
     }
-    const staying=BASE_DRIVERS.filter(d=>d.team===t&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)).filter(d=>{
-      const mv=movedDrivers.get(d.id);return !mv||mv.to===t;
-    });
     const arriving=BASE_DRIVERS.filter(d=>d.team!==t&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)&&movedDrivers.get(d.id)?.to===t);
     const maxS=isOneDriverTeam(t, eos.nextYear)?1:2;
-    teamSeats[t]={count:Math.min(staying.length+arriving.length,maxS),max:maxS,isNew:false,genMod:teamBaseTb(t)||0};
+    teamSeats[t]={count:Math.min(arriving.length,maxS),max:maxS,isNew:false,genMod:teamBaseTb(t)||0};
   });
 
   // ── Build available pool ─────────────────────────────────────────
@@ -6835,21 +6925,33 @@ function eosComputeSignings(){
   const releasedFromMovements=BASE_DRIVERS.filter(d=>releasedIds.has(d.id)&&!retiringIds.has(d.id));
   // Existing BASE_DRIVERS with team=Available (in-season released, not retired)
   const existingAvail=BASE_DRIVERS.filter(d=>d.team==='Available'&&!d._retired&&!retiringIds.has(d.id));
+  // Also include the raw FREE_AGENTS list directly — this is what eos_showEditRoster uses
+  // and reliably finds every valid candidate through, even ones the sources above can miss
+  // (e.g. a driver whose BASE_DRIVERS.team hasn't been updated to 'Available' yet at this
+  // exact point in the sequence, even though they've already been decided as released).
+  // Purely additive — deduplicated downstream the same way every other source already is.
+  const rawFreeAgents=(FREE_AGENTS||[]).filter(f=>{
+    const fid=f.id||f.pid;
+    return fid!=null&&!retiringIds.has(fid);
+  });
 
-  // Exclude: upgrade movers (already in teamSeats.arriving) and contracted drivers
+  // Exclude: upgrade movers (already in teamSeats.arriving), contracted drivers, and
+  // critically: RETIRING drivers must NOT appear in contractedIds or stayingContractedIds
+  // — they are not available for re-signing, own-driver retention, or any other path.
   const contractedIds=new Set([
-    ...BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp).map(d=>d.id),
-    ...BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp).map(d=>d.pid).filter(Boolean),
+    ...BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp&&!retiringIds.has(d.id)&&!closedTeams.has(d.team)).map(d=>d.id),
+    ...BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp&&!retiringIds.has(d.id)&&!closedTeams.has(d.team)).map(d=>d.pid).filter(Boolean),
   ]);
   // Remove contracted drivers who are STAYING (not released/leaving) from pool
   // upgradeIds: already counted as arriving elsewhere
   // contractedIds minus releasedIds minus upgradeIds: the truly contracted-and-staying set
   const stayingContractedIds=new Set([...contractedIds].filter(id=>!releasedIds.has(id)&&!upgradeIds.has(id)));
 
-  const allPool=[...faBase,...filteredFAs,...releasedFromMovements,...existingAvail,...closedTeamDrivers]
+  const allPool=[...faBase,...filteredFAs,...releasedFromMovements,...existingAvail,...closedTeamDrivers,...rawFreeAgents]
     .filter(f=>{
       const fid=f.id||f.pid;
       if(!fid)return false;
+      if(retiringIds.has(fid)||retiringIds.has(f.pid||f.id)||retiringIds.has(f.id||f.pid))return false;
       if(upgradeIds.has(fid)||upgradeIds.has(f.pid||f.id))return false;
       if(stayingContractedIds.has(fid)||stayingContractedIds.has(f.pid||f.id))return false;
       return true;
@@ -6903,6 +7005,110 @@ function eosComputeSignings(){
   const signingDebugLog=[];
   signingDebugLog.push(`Pool after dedup: ${uniquePool.length} drivers available for signing`);
 
+  // Per-driver decision notes, surfaced on the signings page so the player can see WHY a
+  // driver ended up where they did ('Turned down an approach from X', 'Ruled out at Y —
+  // hatred rivalry with Z', ...). Deduped and capped so a driver evaluated repeatedly
+  // across queue iterations doesn't accumulate the same note over and over.
+  const _signingNotes={};
+  function _addSigningNote(driverId,note){
+    if(driverId==null)return;
+    if(!_signingNotes[driverId])_signingNotes[driverId]=[];
+    if(_signingNotes[driverId].includes(note))return;
+    if(_signingNotes[driverId].length>=3)return;
+    _signingNotes[driverId].push(note);
+  }
+
+  // ── Recruit candidates: drivers currently contracted-and-staying at ANOTHER team ──────
+  // Recruitment used to be a separate pass that ran BEFORE releases existed as free agents,
+  // meaning a driver released to make room for someone else's recruit had already missed
+  // their own chance to be recruited that cycle — they could only ever be signed as a
+  // leftover free agent. Folding recruiting in here means every team, filling a vacancy
+  // that's definitely real (releases have already happened), chooses between the best FREE
+  // AGENT and the best RECRUIT target on equal footing, including PQ teams.
+  const recruitedAwayIds=new Set(); // drivers pulled from another team this cycle already
+  const _recruitWillingCache=new Map();
+  function _driverWillingToJoin(driverId,fromTeam,toTeam){
+    const key=`${driverId}::${teamCanonicalName(toTeam)}`;
+    if(_recruitWillingCache.has(key))return _recruitWillingCache.get(key);
+    const relScore=driverTeamRelationScore(driverId,fromTeam);
+    const tenure=driverTenureAtTeam(driverId,fromTeam,eos.year||app.currentSeason);
+    let stayChance=0.15;
+    stayChance+=Math.max(0,relationEffect(relScore,0.35));
+    stayChance+=Math.min(0.25,tenure*0.05);
+    const willing=Math.random()>=Math.min(0.85,stayChance);
+    // Experienced drivers won't accept recruitment to a PQ team — if their current team is
+    // auto-qualifying, being recruited to a PQ seat is effectively a step backward.
+    if(willing){
+      const _toIsNextPQ=(eos._nextPQTeams||[]).some(x=>teamCanonicalName(x)===teamCanonicalName(toTeam));
+      const _fromIsNextPQ=(eos._nextPQTeams||[]).some(x=>teamCanonicalName(x)===teamCanonicalName(fromTeam));
+      const _fdMod=driverTotalMod(driverId)||0;
+      if(_toIsNextPQ&&!_fromIsNextPQ&&_fdMod>0){
+        // Positive-modifier driver being recruited from an auto-qual team to a PQ team —
+        // strong reluctance, but not impossible if the approach is their only viable offer
+        // (handled by the star-driver guarantee picking them up elsewhere instead).
+        if(Math.random()>0.10){
+          _recruitWillingCache.set(key,false);
+          _recruitWillingCache.set(`${driverId}::${teamCanonicalName(toTeam)}::why`,`avoiding PQ team`);
+          return false;
+        }
+      }
+    }
+    _recruitWillingCache.set(key,willing);
+    // Note recorded only when a specific team actually picks this driver, not during
+    // pool construction — see _maybeAddDeclineNote() called after the weighted pick.
+    if(!willing)_recruitWillingCache.set(`${driverId}::${teamCanonicalName(toTeam)}::why`,
+      relationEffect(relScore,0.35)>0.1?`strong relationship with their current team`
+      :tenure>=3?`long tenure at their current team`
+      :null); // null = no note for plain reluctance, not informative enough
+    return willing;
+  }
+  // Called after a team's final pick is known — adds notes only for drivers who actually
+  // declined this specific team (i.e. were genuinely in the shortlist but said no), rather
+  // than every driver in the pool who merely happened to be evaluated during construction.
+  function _maybeAddDeclineNote(declinedDriverId,recruitingTeam){
+    const key=`${declinedDriverId}::${teamCanonicalName(recruitingTeam)}::why`;
+    const why=_recruitWillingCache.get(key);
+    if(!why)return;
+    _addSigningNote(declinedDriverId,`Turned down an approach from ${teamDisplayName(recruitingTeam)} — ${why}`);
+  }
+  function buildRecruitPool(team,ttmTotal,isNew){
+    if(isNew)return [];
+    const others=BASE_DRIVERS.filter(d=>{
+      if(d.team===team||d.team==='Available'||d._retired||d._temp)return false;
+      if(!stayingContractedIds.has(d.id))return false;
+      if(usedIds.has(d.id)||recruitedAwayIds.has(d.id))return false;
+      // Skip drivers already committed to their own team via the retain path — they have
+      // no opening to fill so generating 'turned down approach' notes for them is misleading.
+      if(results.some(r=>r._isOwnDriver&&(r.driver.id===d.id||r.driver.pid===d.id)))return false;
+      if(BASE_DRIVERS.filter(x=>x.team===team&&!x._retired&&!x._temp).some(td=>isRivalryBlocked(d.id,td.id)))return false;
+      return true;
+    });
+    // No hard range filter here — 'targets roughly +/-1.00 around their level' isn't a wall
+    // locked to the team's own raw modifier, it's just describing how wide the weighting
+    // formula's natural preference curve already is (asymmetric fit distance + positive-
+    // modifier priority, applied identically to these candidates and free agents below).
+    // Where a team's actual centre of interest ends up can shift for all sorts of reasons
+    // (a driver on a hot streak, a team leaning toward an upgrade) — the range should follow
+    // that, not override it.
+    const recruits=others
+      .filter(d=>_driverWillingToJoin(d.id,d.team,team))
+      .map(d=>({...d,_isRecruit:true,_donorTeam:d.team}));
+    // This team's OWN continuing drivers (haven't voluntarily departed, haven't been
+    // explicitly released) are ALSO candidates here, not pre-locked seats — retention is
+    // just one outcome among many in the same unified pick, with a strong bias toward
+    // staying (relationship/tenure, reused below) that erodes if their modifier dropped
+    // this past season or their form has soured. No willingness roll — they're not being
+    // asked to move anywhere.
+    const own=BASE_DRIVERS.filter(d=>{
+      if(d.team!==team||d._retired||d._temp)return false;
+      if(retiringIds.has(d.id))return false; // retiring drivers cannot be retained
+      if(!stayingContractedIds.has(d.id))return false;
+      if(usedIds.has(d.id))return false;
+      return true;
+    }).map(d=>({...d,_isOwnDriver:true}));
+    return[...recruits,...own];
+  }
+
   // ── Signing loop — round-robin so every team gets a pick before second picks ─
   // Round 1: each team picks their FIRST vacancy (best teams get first pick within round)
   // Round 2: teams with a second vacancy pick again from what remains
@@ -6919,6 +7125,7 @@ function eosComputeSignings(){
 
     const ttmBase=teamBaseTb(team)||0;
     const ttmTotal=ttmBase+(getTeamMod(team)||0);
+    let cands0=[]; // hoisted — populated in the realistic-candidates branch, empty otherwise (new/PQ)
     const isNew=ts.isNew||false;
     // isPQ for signing: use next season's computed PQ list, not current preqDriverIds
     const _nextPQ=eos._nextPQTeams||[];
@@ -6927,8 +7134,11 @@ function eosComputeSignings(){
     const driverMod=f=>(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);
     const bias=getTeamNationalityBias(team,eos.nextYear);
 
-    // Pool: exclude used drivers and drivers who just left this team
-    const pool=uniquePool.filter(f=>!usedIds.has(f.id)&&!leftTeamMap.get(f.id)?.has(team)&&!relationBlockedPairs.has(`${f.id}::${teamCanonicalName(team)}`));
+    // Pool: free agents (excluding used/just-left/relationship-blocked) merged with recruit
+    // candidates from other teams — a unified pool so both options compete on equal footing.
+    const faPool=uniquePool.filter(f=>!usedIds.has(f.id)&&!leftTeamMap.get(f.id)?.has(team)&&!relationBlockedPairs.has(`${f.id}::${teamCanonicalName(team)}`));
+    const recruitPool=buildRecruitPool(team,ttmTotal,isNew);
+    const pool=[...faPool,...recruitPool];
     if(!pool.length){
       signingDebugLog.push(`⚠ ${teamDisplayName(team)} R${round}: pool exhausted (ttm=${ttmTotal.toFixed(1)}, vacancies=${totalNeeded-alreadyPicked})`);
       return;
@@ -6966,6 +7176,16 @@ function eosComputeSignings(){
         const dm=driverMod(f);
         let w=dm<=0?Math.max(0.5,2.0-dm*0.3):Math.max(0.05,1.0/(dm+1));
         if(bias&&driverNationalityOf(f)===bias.nation)w*=NATIONALITY_BIAS_WEIGHT[bias.level];
+        // Same own-driver retention bias as the main branch, scaled down to fit this
+        // weighting's smaller numeric range.
+        if(f._isOwnDriver){
+          const _startMod=app._seasonStartDriverMod?.[f.id];
+          const _rawChange=_startMod!=null?(dm-_startMod):0;
+          const _dropPenalty=_rawChange<0?Math.min(0.85,Math.abs(_rawChange)*0.6):0;
+          const _formEOSOwn=driverFormScore(f.id);
+          const _formPenalty=_formEOSOwn<-0.5?Math.min(0.5,Math.abs(_formEOSOwn)*0.2):0;
+          w*=Math.max(0.4,3.0-_dropPenalty-_formPenalty);
+        }
         return w;
       };
       const pwts=pool.map(f=>payWeight(f));
@@ -6991,21 +7211,27 @@ function eosComputeSignings(){
       }
 
       // Non-PQ tiered picking with effective pool
-      const cands0=findRealisticCandidates(effectivePool,ttmBase,ttmTotal,round,driverMod,(msg)=>signingDebugLog.push(`  ${teamDisplayName(team)} R${round}: ${msg}`),bias);
+      cands0=findRealisticCandidates(effectivePool,ttmBase,ttmTotal,round,driverMod,(msg)=>signingDebugLog.push(`  ${teamDisplayName(team)} R${round}: ${msg}`),bias);
       let cands=cands0;
       if(!cands.length)cands=effectivePool;
       if(!cands.length)cands=pool; // absolute fallback to unrestricted pool
-      // Record every driver this team seriously considered — used later to detect
-      // 'holdout' situations where a driver was a realistic candidate for more than one
-      // team but only signed with one of them.
-      cands.forEach(f=>{
+      // Record only genuine candidates for holdout detection — NOT the absolute fallback pool
+      // (cands0), since every driver in the unrestricted fallback list would otherwise appear as
+      // 'considered by 9 teams' and generate spurious holdout news for weak drivers.
+      // Only drivers found via the realistic shortlist (cands0) count as genuinely contested.
+      cands0.forEach(f=>{
         const fid=f.id||f.pid;
         if(!driverConsideredByTeams[fid])driverConsideredByTeams[fid]=new Set();
         driverConsideredByTeams[fid].add(team);
       });
 
       // Apply rivalry penalty + experience weighting + season momentum bonus
-      const existingTeamDriverIds=BASE_DRIVERS.filter(d=>d.team===team&&!d._retired&&!d._temp).map(d=>d.id);
+      // Drivers ALREADY SIGNED to this team this cycle — under the all-seats-open design
+      // this (not stale BASE_DRIVERS team fields, which are just candidates now) is the
+      // confirmed roster a prospective second driver actually weighs their relationship
+      // against. Hatred with a signed driver = hard rejection; sub-hatred rivalry scales
+      // the weight down via rivalryJoinPenalty below.
+      const existingTeamDriverIds=results.filter(r=>r.team===team).map(r=>r.driver.id);
       const weights=cands.map(f=>{
         const _fEntries=app.history.weekends.filter(w=>(w.race||[]).some(r=>r.id===(f.id||f.pid))).length;
         // ── Experience weighting ─────────────────────────────────────
@@ -7021,7 +7247,36 @@ function eosComputeSignings(){
         // gain >= 1.0: +60% weight multiplier. Scales linearly from 0 gain (no bonus) to 1.0 (max bonus).
         const gain = seasonModGain(f);
         const _momentumFactor = 1 + Math.min(0.60, gain * 0.60);
-        let baseW = Math.max(0.05, (1 / (Math.abs(driverMod(f) - ttmTotal) + 0.5)) * _expFactor * _momentumFactor);
+        // Asymmetric fit distance: being BETTER than a team's level costs much less than being
+        // WORSE. A team is glad to have a driver who's overqualified for their level, but
+        // doesn't want one who's clearly worse than what they need when better options exist
+        // — the old symmetric distance penalty treated both directions the same, which meant
+        // a strong driver competing for a seat at a weak team could still lose out to a much
+        // worse driver who simply happened to sit closer to that team's own (negative) level.
+        const _fitGap=driverMod(f)-ttmTotal;
+        const _fitPenalty=_fitGap>=0?_fitGap*0.35:Math.abs(_fitGap);
+        let baseW = Math.max(0.05, (1 / (_fitPenalty + 0.5)) * _expFactor * _momentumFactor);
+        // Positive-modifier priority: a genuinely good free agent shouldn't be systematically
+        // passed over just because their level doesn't precisely match any one team's needs —
+        // scales up to +80% weight at a +2.0 modifier, on top of the asymmetric fit discount
+        // above.
+        if(driverMod(f)>0)baseW*=1+Math.min(0.80,driverMod(f)*0.40);
+        // PQ team preference: experienced drivers (positive modifier) strongly prefer
+        // auto-qual teams and will only take a PQ seat as a last resort. A driver with a
+        // starting negative modifier (typically a rookie or long-time backmarker) is
+        // comfortable with PQ — any drive is a step for them. This uses _nextPQTeams so
+        // the preference is based on NEXT year's PQ status, not the current season's.
+        const _isNextPQ=(eos._nextPQTeams||[]).some(x=>teamCanonicalName(x)===teamCanonicalName(team));
+        if(_isNextPQ){
+          const _fMod=driverMod(f);
+          if(_fMod>0){
+            // Experienced positive-modifier driver strongly avoids PQ — weight cut to 12.5%
+            // of normal. Still possible as a last resort, just very unlikely when an auto-qual
+            // alternative exists.
+            baseW*=0.125;
+          }
+          // Negative-modifier drivers: no extra penalty — PQ is a natural destination.
+        }
         // Relationship: a mild thumb toward re-signing someone this team got on well with in
         // the past, away from someone with a soured history — no effect at all for a driver
         // with no prior relationship with this team (relationEffect's dead zone covers that).
@@ -7029,109 +7284,222 @@ function eosComputeSignings(){
         // Nationality bias: tip the scales toward a similarly-fitting driver from the
         // team's favoured country — a soft nudge among comparable options, not a rule.
         if(bias&&driverNationalityOf(f)===bias.nation)baseW*=NATIONALITY_BIAS_WEIGHT[bias.level];
-        // Rivalry penalty
-        const maxPenalty=existingTeamDriverIds.reduce((max,eid)=>Math.max(max,rivalryJoinPenalty(f.id||f.pid,eid)),0);
-        if(maxPenalty>=100)return 0.001;
+        // Own-driver retention: a team's current driver isn't a pre-locked seat any more —
+        // they're a candidate like anyone else, but with a strong default bias toward
+        // staying (re-signing your own driver should be the normal, likely outcome). That
+        // bias erodes with the signals a team would actually notice: a modifier drop over
+        // the past season, poor current form, sitting well below the team's own level, and
+        // being well behind their teammate — the latter two being exactly the judgments
+        // that used to be separate speculative 'release' rolls before signings existed,
+        // now expressed as 'how strongly does the team want to re-sign them' with full
+        // knowledge of the actual alternatives.
+        if(f._isOwnDriver){
+          const _startMod=app._seasonStartDriverMod?.[f.id];
+          const _rawChange=_startMod!=null?(driverMod(f)-_startMod):0;
+          const _dropPenalty=_rawChange<0?Math.min(0.85,Math.abs(_rawChange)*0.6):0;
+          const _formEOSOwn=driverFormScore(f.id);
+          const _formPenalty=_formEOSOwn<-0.5?Math.min(0.5,Math.abs(_formEOSOwn)*0.2):0;
+          // Below team level: erode retention when the driver sits well below the team's
+          // own level (gap beyond 1.2), carrying over the old release rule's protections —
+          // very good form exempts entirely, a positive-modifier in-form driver ('credible
+          // second driver') is judged at half severity, and a franchise driver (>=2.50)
+          // is exempt unless their form has collapsed.
+          const _ownGap=ttmTotal-driverMod(f);
+          const _veryPoorFormOwn=_formEOSOwn<-1.5;
+          let _belowTeamPenalty=0;
+          if(_ownGap>1.2&&_formEOSOwn<=1.5&&(driverMod(f)<2.50||_veryPoorFormOwn)){
+            _belowTeamPenalty=Math.min(1.1,(_ownGap-1.2)*0.45);
+            if(driverMod(f)>0&&_formEOSOwn>0)_belowTeamPenalty*=0.5; // credible second driver
+          }
+          // Below teammate: erode retention when well behind the best other driver still
+          // at this team (same 1.2 threshold and protections as the old release rule).
+          const _bestTeammateMod=BASE_DRIVERS.filter(x=>x.team===team&&x.id!==f.id&&!x._retired&&!x._temp&&stayingContractedIds.has(x.id))
+            .reduce((m,x)=>Math.max(m,driverMod(x)),-99);
+          let _belowTeammatePenalty=0;
+          if(_bestTeammateMod>-99&&_bestTeammateMod-driverMod(f)>1.2&&_formEOSOwn<=1.5){
+            _belowTeammatePenalty=Math.min(0.9,(_bestTeammateMod-driverMod(f)-1.2)*0.35);
+            if(driverMod(f)>0&&_formEOSOwn>0)_belowTeammatePenalty*=0.5;
+          }
+          baseW*=Math.max(0.25,3.0-_dropPenalty-_formPenalty-_belowTeamPenalty-_belowTeammatePenalty);
+
+          // #1 driver preference: if both team drivers are 3.00+ and this driver is the
+          // lower-modifier one, they may prefer to seek a #1 seat at another top team
+          // rather than be a permanent #2. Only triggers if a plausible +2.00 destination
+          // exists — no point leaving if there's nowhere better to go.
+          const _myMod=driverMod(f);
+          if(_bestTeammateMod>=3.0&&_myMod>=3.0&&_bestTeammateMod>_myMod){
+            const _goodTeamExists=activeTeams.some(t=>{
+              if(teamCanonicalName(t)===teamCanonicalName(team))return false;
+              return(teamBaseTb(t)||0)+(getTeamMod(t)||0)>=2.0;
+            });
+            if(_goodTeamExists){
+              const _wantNo1Chance=0.25+Math.min(0.35,(_bestTeammateMod-_myMod)*0.3);
+              if(Math.random()<_wantNo1Chance){
+                f._wantsNo1Seat=true;
+                baseW*=0.08;
+              }
+            }
+          }
+        }
+        // Rivalry penalty: leniency granted to a driver who wants to be #1 at another top team
+        const _rivalryLeniency=f._wantsNo1Seat?0.5:1.0; // halve the relationship penalty hurdle
+        const maxPenalty=existingTeamDriverIds.reduce((max,eid)=>Math.max(max,rivalryJoinPenalty(f.id||f.pid,eid)*_rivalryLeniency),0);
+        if(maxPenalty>=100){
+          // Hatred with a driver already signed here = hard rejection, and worth telling
+          // the player about — record which signed driver ruled this pairing out.
+          const _hateWith=existingTeamDriverIds.find(eid=>rivalryJoinPenalty(f.id||f.pid,eid)>=100);
+          const _hateBd=_hateWith?results.find(r=>r.driver.id===_hateWith)?.driver:null;
+          _addSigningNote(f.id||f.pid,`Ruled out at ${teamDisplayName(team)} — hatred rivalry with ${_hateBd?((_hateBd.firstName||_hateBd.fn||'')+' '+(_hateBd.lastName||_hateBd.ln||_hateBd.name||'')).trim():'a signed driver'}`);
+          return 0;
+        }
+        if(maxPenalty>=50){
+          const _rvWith=existingTeamDriverIds.find(eid=>rivalryJoinPenalty(f.id||f.pid,eid)>=50);
+          const _rvBd=_rvWith?results.find(r=>r.driver.id===_rvWith)?.driver:null;
+          _addSigningNote(f.id||f.pid,`Wary of ${teamDisplayName(team)} — dislike relationship with ${_rvBd?((_rvBd.firstName||_rvBd.fn||'')+' '+(_rvBd.lastName||_rvBd.ln||_rvBd.name||'')).trim():'a signed driver'}`);
+        }
         if(maxPenalty>0)return baseW*(1-maxPenalty/200);
         return baseW;
       });
       const tot=weights.reduce((a,b)=>a+b,0);let r=Math.random()*tot,idx=0;
-      for(let j=0;j<weights.length;j++){r-=weights[j];if(r<=0){idx=j;break;}}
-      pick=cands[Math.min(idx,cands.length-1)];
+      if(tot<=0){pick=null;}
+      else{
+        for(let j=0;j<weights.length;j++){r-=weights[j];if(r<=0){idx=j;break;}}
+        pick=cands[Math.min(idx,cands.length-1)];
+      }
     }
 
     if(pick){
       const gm_for_reason=isNew?(ts.genMod||0):ttmBase;
-      const reason=isNew?`New team hire (genMod ${gm_for_reason>=0?'+':''}${gm_for_reason.toFixed(1)})`
-        :isPQ?'PQ — pool selection'
-        :`Modifier match R${round} (team ${ttmTotal.toFixed(2)})`;
-      results.push({driver:pick,team,reason});
+      // Reason string: only set it when it tells the player something meaningful about WHY
+      // the choice was made. Source/pool information ('Recruited from', 'PQ pool', 'Modifier
+      // match') is already shown visually via the source tag — don't duplicate it as a reason.
+      const reason='';
+      results.push({driver:pick,team,reason,_isRecruit:pick._isRecruit||false,_donorTeam:pick._donorTeam||null,_isOwnDriver:pick._isOwnDriver||false});
       usedIds.add(pick.id);
       if(pick.pid&&pick.pid!==pick.id)usedIds.add(pick.pid);
       const pname=(pick.firstName||pick.fn||'')+' '+(pick.lastName||pick.ln||pick.name||'');
-      signingDebugLog.push(`  ✓ ${teamDisplayName(team)} R${round}: signed ${pname.trim()} (driver ${driverMod(pick).toFixed(2)}, team ${ttmTotal.toFixed(2)})`);
+      // Add decline notes for drivers in the realistic shortlist who weren't picked —
+      // these were genuinely evaluated candidates, not just everyone in the fallback pool,
+      // so "turned down by" notes are appropriate and meaningful here.
+      const pickedId=pick.id||pick.pid;
+      (cands0||[]).forEach(c=>{
+        const cid=c.id||c.pid;
+        if(cid===pickedId)return;
+        if(c._isRecruit)_maybeAddDeclineNote(cid,team);
+      });
+      if(pick._isOwnDriver){
+        signingDebugLog.push(`  = ${teamDisplayName(team)} R${round}: retained ${pname.trim()} (driver ${driverMod(pick).toFixed(2)}, team ${ttmTotal.toFixed(2)})`);
+      } else if(pick._wantsNo1Seat){
+        // Driver left their old team to be a #1 — show meaningful reason
+        results[results.length-1].reason=`Wants to be team's #1 driver`;
+        signingDebugLog.push(`  1️⃣ ${teamDisplayName(team)} R${round}: signed ${pname.trim()} who wanted a #1 seat (driver ${driverMod(pick).toFixed(2)}, team ${ttmTotal.toFixed(2)})`);
+      } else if(pick._isRecruit){
+        recruitedAwayIds.add(pick.id);
+        const donorTs=teamSeats[pick._donorTeam];
+        if(donorTs)donorTs.count=Math.max(0,donorTs.count-1);
+        signingDebugLog.push(`  ⇄ ${teamDisplayName(team)} R${round}: recruited ${pname.trim()} from ${teamDisplayName(pick._donorTeam)} (driver ${driverMod(pick).toFixed(2)}, team ${ttmTotal.toFixed(2)})`);
+      } else {
+        signingDebugLog.push(`  ✓ ${teamDisplayName(team)} R${round}: signed ${pname.trim()} (driver ${driverMod(pick).toFixed(2)}, team ${ttmTotal.toFixed(2)})`);
+      }
+      return pick._isRecruit?pick._donorTeam:null;
     } else {
       signingDebugLog.push(`  ✗ ${teamDisplayName(team)} R${round}: no pick made (pool=${pool.length}, cands available)`);
+      return null;
     }
   }
 
-  // ── EOS poaching pre-pass ────────────────────────────────────────────
-  // Everything above (the free-agent pool, uniquePool) deliberately excludes any driver who's
-  // staying under contract elsewhere — stayingContractedIds is filtered OUT of the signing
-  // pool entirely. That means, left alone, EOS recruits can only ever be drivers who were
-  // released/quit/closed-team — and strong teams rarely release good drivers, so the pool a
-  // top team draws from is structurally skewed toward lower-modifier origin teams. This gives
-  // strong teams a real (but uncommon) chance to instead sign a promising or in-form driver
-  // away from a weaker team's roster, mirroring the in-season attemptSigningFromRival
-  // mechanic. The donor team's seat count is reduced, creating a genuine new vacancy that the
-  // normal round-robin pool loop below fills as usual.
-  function attemptEosPoach(team,ttmTotal,excludeIds){
-    if(Math.random()>0.55)return null; // uncommon-but-real, not the default path
-    const prospects=BASE_DRIVERS.filter(d=>{
-      if(d.team===team||d.team==='Available'||d._retired||d._temp)return false;
-      if(retiringIds.has(d.id))return false; // retiring this cycle — not actually applied to
-      // BASE_DRIVERS yet at this point in the sequence, so d._retired above can't catch this
-      // on its own. Without this check a driver who'd just decided to retire could be poached
-      // and un-retired for one more season instead.
-      if(excludeIds.includes(d.id))return false;
-      if(!stayingContractedIds.has(d.id))return false; // only a driver actually staying put has anything to poach
-      const donorTtm=teamTotalMod(d.team);
-      if(donorTtm>=ttmTotal-0.3)return false; // not enough of an upgrade to tempt them
-      const dmod=driverTotalMod(d.id);
-      const form=driverFormScore(d.id);
-      // 'Promising and/or in form': outperforming their own team's level, OR trending well
-      // this season — either is enough to catch a bigger team's eye.
-      return dmod>donorTtm||form>=0.5;
+  // Track which contracted drivers have been definitively not-retained — detected inline
+  // as each team fills its seats rather than in a batch at the end, so teams still in the
+  // queue can consider a just-released quality driver before they've exhausted their options.
+  const _notRetainedIds=new Set();
+  function _releaseNotRetained(team){
+    // Called after a team fills all its seats. Any stayingContractedId that was at this
+    // team but didn't end up in results is officially not retained — inject them now.
+    stayingContractedIds.forEach(id=>{
+      if(_notRetainedIds.has(id)||usedIds.has(id))return;
+      if(retiringIds.has(id))return; // retiring — not a vacancy to fill, not available for signing
+      const d=BASE_DRIVERS.find(x=>x.id===id);
+      if(!d||d.team!==team)return;
+      // Still a candidate at a different team via the recruit pool — don't release yet
+      if(!usedIds.has(id)&&!results.some(r=>r.driver.id===id)){
+        _notRetainedIds.add(id);
+        uniquePool.push(d); // available to later-queued teams immediately
+        if(!leftTeamMap.has(id))leftTeamMap.set(id,new Set());
+        leftTeamMap.get(id).add(team);
+        // Record the movement now (same as the final not-retained pass below) so the
+        // seat-cap accounting step later sees this seat as already vacated. Without this,
+        // the driver stays in BASE_DRIVERS at their old team with no movements/signings
+        // entry pointing away from it, so the cap accounting counts them as a holdover
+        // still occupying the seat — causing genuine replacement signings (e.g. a recruit
+        // brought in to fill this exact vacancy) to be wrongly skipped as 'over cap'.
+        recordDriverMovement(id,'released',team,null,'Not retained — squad moved on',0,eos.year||app.currentSeason,driverFullName(d)||d.name);
+        applyDriverTeamRelation(id,team,-Math.random()*6,'Not retained at end of season');
+        if(!eos.movements)eos.movements=[];
+        eos.movements.push({d,from:team,to:null,type:'release',approved:true,reason:'Not retained — squad moved on'});
+        signingDebugLog.push(`  ○ ${teamDisplayName(team)}: did not retain ${driverFullName(d)||d.name} — available mid-queue`);
+      }
     });
-    if(!prospects.length)return null;
-    const target=pickWeightedByForm(prospects);
-    return{driver:target,fromTeam:target.team};
   }
-  // 'Strong team' is defined RELATIVE to this season's field (top third, at least 4 teams)
-  // rather than an absolute modifier threshold — an absolute cutoff meant this could quietly
-  // stop firing at all in a career where the overall modifier spread has drifted over many
-  // seasons. This also directly targets the actual bottleneck: the round-robin below only
-  // ever draws from released/free-agent drivers, so a genuinely strong team that both its
-  // drivers stayed with keeps drawing a blank here every single season it doesn't happen to
-  // have a vacancy — widening eligibility and raising the odds/cap is what actually makes
-  // this visible in practice rather than a rare once-a-career event.
-  const _eosPoachEligibleTeams=new Set(sorted.slice(0,Math.max(4,Math.ceil(sorted.length*0.35))));
-  const eosPoachCap=4+Math.floor(Math.random()*3); // 4-6 poaches this EOS cycle, league-wide
-  let eosPoachCount=0;
-  const poachedAwayIds=new Set();
-  sorted.forEach(team=>{
-    if(eosPoachCount>=eosPoachCap)return;
-    if(!_eosPoachEligibleTeams.has(team))return;
-    const ts=teamSeats[team];if(!ts)return;
-    if((ts.max||2)-(ts.count||0)<=0)return; // no vacancy to use the poach on
-    const ttmTotal=(teamBaseTb(team)||0)+(getTeamMod(team)||0);
-    const poach=attemptEosPoach(team,ttmTotal,[...usedIds,...poachedAwayIds]);
-    if(!poach)return;
-    const{driver,fromTeam}=poach;
-    const donorSeats=teamSeats[fromTeam];
-    if(donorSeats)donorSeats.count=Math.max(0,(donorSeats.count||0)-1);
-    results.push({driver,team,reason:`EOS poach from ${teamDisplayName(fromTeam)} — promising/in-form driver`});
-    usedIds.add(driver.id);
-    poachedAwayIds.add(driver.id);
-    eosPoachCount++;
-    // Same motivation-boost / rivalry-seed / relationship treatment as the in-season poach.
-    const driverBoost=Math.round((0.10+Math.random()*0.10)*100)/100;
-    applyDriverMod(driver.id,driverBoost);
-    recordMod('driver',driver.id,driverFullName(driver)||driver.name,driverBoost,'Signed by a stronger team at end of season','signing');
-    addTeamRivalryPoints(team,fromTeam,Math.floor(Math.random()*26)+15,'Driver poached at end of season',null);
-    applyDriverTeamRelation(driver.id,fromTeam,-Math.random()*10,'Poached away at end of season');
-    applyDriverTeamRelation(driver.id,team,6,'Poached by this team at end of season');
-    signingDebugLog.push(`⇄ EOS poach: ${teamDisplayName(team)} signs ${driverFullName(driver)||driver.name} from ${teamDisplayName(fromTeam)}`);
-  });
 
-  // Round 1: every team picks first driver
-  sorted.forEach(t=>pickForTeam(t,1));
-  if(uniquePool.filter(f=>!usedIds.has(f.id)).length>0){
-    // Round 2: teams that need a second driver pick again
-    sorted.forEach(t=>pickForTeam(t,2));
+  // ── Unified queue: recruiting and signing combined ──────────────────
+  let _signingQueue=sorted.filter(t=>{const ts=teamSeats[t];return ts&&(ts.max-ts.count)>0;});
+  let _queueGuard=0;
+  while(_signingQueue.length&&_queueGuard<400){
+    _queueGuard++;
+    const team=_signingQueue.shift();
+    const ts=teamSeats[team];if(!ts)continue;
+    const alreadyPicked=results.filter(r=>r.team===team).length;
+    if((ts.count+alreadyPicked)>=(ts.max||2)){_releaseNotRetained(team);continue;} // already filled
+    const round=alreadyPicked+1;
+    const donorTeam=pickForTeam(team,round);
+    const nowPicked=results.filter(r=>r.team===team).length;
+    if((ts.count+nowPicked)<(ts.max||2)){
+      _signingQueue.push(team); // still needs more — back of the queue
+    } else {
+      _releaseNotRetained(team); // team is now full — release any not-retained drivers immediately
+    }
+    if(donorTeam){
+      const donorTs=teamSeats[donorTeam];
+      const donorPicked=results.filter(r=>r.team===donorTeam).length;
+      if(donorTs&&(donorTs.count+donorPicked)<(donorTs.max||2))_signingQueue.unshift(donorTeam);
+      else _releaseNotRetained(donorTeam); // donor now full after losing their driver
+    }
   }
+  // Release any remaining contracted drivers whose team went through the queue but never
+  // called _releaseNotRetained (e.g. a team that never fully filled — still need to formally
+  // mark any not-retained driver there so the star-driver guarantee can find them).
+  sorted.forEach(t=>_releaseNotRetained(t));
 
   signingDebugLog.push(`Main loop: ${results.length} picks made, ${uniquePool.filter(f=>!usedIds.has(f.id)).length} pool remaining`);
+
+  // A driver who was a genuine candidate this cycle (their own team, or as a recruit target
+  // elsewhere) but never actually won a seat anywhere has effectively been let go — their own
+  // team moved on, and nobody else took them either. Without this they'd incorrectly still
+  // show up at their old team (their BASE_DRIVERS.team field was never touched, since they
+  // never appeared in results at all) despite the seat having gone to someone else. Released
+  // properly, and folded into the pool below so a strong driver who simply fell through the
+  // cracks of the main loop still gets the same star-driver-guarantee/fallback safety net as
+  // anyone else who ended up unsigned.
+  // Final not-retained pass: any stayingContractedId not yet handled (mid-queue release
+  // catches most, but drivers at teams that never fully filled may still need releasing).
+  stayingContractedIds.forEach(id=>{
+    if(_notRetainedIds.has(id)||usedIds.has(id))return;
+    if(retiringIds.has(id))return; // retiring — not a vacancy, not available for re-signing
+    const d=BASE_DRIVERS.find(x=>x.id===id);
+    if(!d)return;
+    const _fromTeam=d.team;
+    recordDriverMovement(id,'released',_fromTeam,null,'Not retained — squad moved on',0,eos.year||app.currentSeason,driverFullName(d)||d.name);
+    // Same rejoin block as any other release — leftTeamMap was built before this loop ran,
+    // so without this the star-driver-guarantee/fallback stages below could sign a
+    // not-retained driver straight back to the exact team that just moved on from them.
+    if(!leftTeamMap.has(id))leftTeamMap.set(id,new Set());
+    leftTeamMap.get(id).add(_fromTeam);
+    applyDriverTeamRelation(id,_fromTeam,-Math.random()*6,'Not retained at end of season');
+    if(!eos.movements)eos.movements=[];
+    eos.movements.push({d,from:_fromTeam,to:null,type:'release',approved:true,reason:'Not retained — squad moved on'});
+    uniquePool.push(d);
+    signingDebugLog.push(`  ○ ${teamDisplayName(_fromTeam)}: did not retain ${driverFullName(d)||d.name} — enters free agency`);
+  });
 
   // Hard cap: never exceed maxSeats per team
   const signedCount={};
@@ -7154,6 +7522,12 @@ function eosComputeSignings(){
     const driverMod2=f=>(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);
     const teamsWithVacancyThisPass=new Set(filteredResults.map(s=>s.team));
     filteredResults.forEach(sign=>{
+      // Holdout is only for two teams who each independently picked a FREE AGENT from the
+      // pool this round — it isn't meant to touch an own-driver retention or an already-
+      // decided recruit, since reassigning .team on one of those leaves the _isOwnDriver/
+      // _isRecruit tag pointing at the wrong team and corrupts all the downstream
+      // relationship/movement processing that reads it.
+      if(sign._isOwnDriver||sign._isRecruit)return;
       const pick=sign.driver;
       const topTeam=sign.team;
       const topTtm=(teamBaseTb(topTeam)||0)+(getTeamMod(topTeam)||0);
@@ -7175,7 +7549,7 @@ function eosComputeSignings(){
       // round to swap with. This needs no seat-capacity check at all: X takes the
       // underdog's seat, and the underdog's own pick (Y) takes X's vacated seat at the
       // top team, so team sizes stay exactly balanced on both sides.
-      const underdogSign=filteredResults.find(s=>s.team===bestUnderdog);
+      const underdogSign=filteredResults.find(s=>s.team===bestUnderdog&&!s._isOwnDriver&&!s._isRecruit);
       if(!underdogSign||underdogSign===sign)return;
       // Age-weighted swap chance: young drivers overwhelmingly pick the best team; older
       // drivers are more open to a smaller team.
@@ -7198,14 +7572,18 @@ function eosComputeSignings(){
         const otherPick=underdogSign.driver;
         const opname=((otherPick.firstName||otherPick.fn||'')+' '+(otherPick.lastName||otherPick.ln||otherPick.name||'')).trim();
         sign.team=bestUnderdog;
-        sign.reason=`Holdout — chose ${teamDisplayName(bestUnderdog)} over ${teamDisplayName(topTeam)}`;
+        sign.reason=`Chose ${teamDisplayName(bestUnderdog)} over ${teamDisplayName(topTeam)}`;
         sign._holdoutSwap={from:topTeam,to:bestUnderdog};
         underdogSign.team=topTeam;
-        underdogSign.reason=`Signed after ${pname} chose ${teamDisplayName(bestUnderdog)} instead`;
+        underdogSign.reason=``; // the swap itself is the story — no extra reason needed
         underdogSign._holdoutSwap={from:bestUnderdog,to:topTeam};
         signingDebugLog.push(`  ⇄ Holdout: ${pname} surprises paddock, signs for ${teamDisplayName(bestUnderdog)} over ${teamDisplayName(topTeam)} — ${opname} takes the vacated seat at ${teamDisplayName(topTeam)}`);
       } else {
-        signingDebugLog.push(`  ~ Contested: ${pname} weighed ${teamDisplayName(bestUnderdog)} but stays with ${teamDisplayName(topTeam)}`);
+        const _isReSign=sign._isOwnDriver||(sign.driver.team&&teamCanonicalName(sign.driver.team)===teamCanonicalName(topTeam));
+        sign.reason=_isReSign
+          ?`Considered ${teamDisplayName(bestUnderdog)}, stays with ${teamDisplayName(topTeam)}`
+          :`Chose ${teamDisplayName(topTeam)} over ${teamDisplayName(bestUnderdog)}`;
+        signingDebugLog.push(`  ~ Contested: ${pname} considered ${teamDisplayName(bestUnderdog)} but stays with ${teamDisplayName(topTeam)}`);
       }
     });
   }
@@ -7214,7 +7592,7 @@ function eosComputeSignings(){
   // If any team still has vacancies after the weighted loop, assign from remaining pool
   // without ANY modifier filtering. This guarantees full rosters.
   const signedIds=new Set(filteredResults.map(s=>s.driver.id));
-  let remainingPool=uniquePool.filter(f=>!signedIds.has(f.id));
+  let remainingPool=uniquePool.filter(f=>!signedIds.has(f.id)&&!retiringIds.has(f.id||f.pid));
 
   // Process teams with at least one leftTeamMap-restricted vacancy LAST — this gives
   // other teams first chance to draw from the shared remaining pool, so a driver who
@@ -7246,7 +7624,12 @@ function eosComputeSignings(){
       // unrestricted if the pool genuinely has nothing that fits any tier.
       const _realisticCands=findRealisticCandidates(_fallbackSource,_ttmBaseForFallback,_ttmForFallback,2,_driverModForFallback);
       const _pickPool=_realisticCands.length?_realisticCands:_fallbackSource;
-      const pick=_pickPool[Math.floor(Math.random()*_pickPool.length)];
+      // Prioritize the strongest remaining positive-modifier free agent deterministically —
+      // this is the last-resort stage, so a genuinely good driver (e.g. +1.50) shouldn't lose
+      // out to random chance against weaker candidates and end up going unsigned. Falls back
+      // to the existing random pick when nothing in the pool has a positive modifier.
+      const _bestPositiveFallback=_pickPool.filter(f=>_driverModForFallback(f)>0).sort((a,b)=>_driverModForFallback(b)-_driverModForFallback(a))[0];
+      const pick=_bestPositiveFallback||_pickPool[Math.floor(Math.random()*_pickPool.length)];
       if(!pick)break;
       const reason=`Fallback fill (${team} had ${stillNeeded} vacancy)`;
       filteredResults.push({driver:pick,team,reason});
@@ -7257,18 +7640,23 @@ function eosComputeSignings(){
     }
   });
 
-  // Star driver guarantee: a high-modifier free agent (>=3.0) should never end up
-  // completely unsigned just because every team's realistic-range check happened to fall
-  // short of them. Tries progressively lower tiers of team strength before accepting a
-  // truly weak team — top teams first (>=3.0), then any positive-modifier team, then
-  // anything above -1.00, and only as a last resort any remaining team at all. Within
-  // each tier, a genuine vacancy is preferred over displacing an existing signing.
-  const STAR_DRIVER_THRESHOLD=3.0;
+  // Star driver guarantee: a clearly good free agent (>=1.0) should never end up completely
+  // unsigned just because every team's realistic-range check happened to fall short of them.
+  // Tries progressively lower tiers of team strength before accepting a truly weak team —
+  // top teams first (>=3.0), then any positive-modifier team, then anything above -1.00, and
+  // only as a last resort any remaining team at all. Within each tier, a genuine vacancy is
+  // preferred over displacing an existing signing, and displacement only ever replaces a
+  // signing that's genuinely WORSE than the star, never an equal-or-better one.
+  const STAR_DRIVER_THRESHOLD=0.0; // any positive-modifier driver deserves a guaranteed place
   const _teamTtmForStar=t=>(teamBaseTb(t)||0)+(getTeamMod(t)||0);
   const _starTierThresholds=[3.0,0.0,-1.0,-Infinity];
   const _starDrivers=remainingPool.filter(f=>{
     const fMod=(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);
     return fMod>=STAR_DRIVER_THRESHOLD;
+  }).map(f=>{
+    // Normalise to the BASE_DRIVERS entry so leftTeamMap / signedIds checks use a consistent id
+    const _bd=BASE_DRIVERS.find(d=>d.id===f.id||d.id===f.pid||(f.pid&&d.pid===f.pid));
+    return _bd||f;
   }).sort((a,b)=>{
     const aMod=(a.driverBonus||a.db||0)+(getDriverMod(a.id)||0);
     const bMod=(b.driverBonus||b.db||0)+(getDriverMod(b.id)||0);
@@ -7286,7 +7674,7 @@ function eosComputeSignings(){
     }).sort((a,b)=>_teamTtmForStar(a)-_teamTtmForStar(b));
     if(_vacantTeamsInTier.length){
       const team=_vacantTeamsInTier[0];
-      filteredResults.push({driver:star,team,reason:'Star driver guarantee — no team otherwise signed them'});
+      filteredResults.push({driver:star,team,reason:'',_isRecruit:false,_isOwnDriver:false});
       signedIds.add(star.id);
       signedCount[team]=(signedCount[team]||0)+1;
       remainingPool=remainingPool.filter(f=>f.id!==star.id);
@@ -7313,7 +7701,7 @@ function eosComputeSignings(){
       const _starMod=(star.driverBonus||star.db||0)+(getDriverMod(star.id)||0);
       if(_displacedMod>=_starMod)continue; // this team's weakest signing is still better than the star — try the next team in this tier
       const idx=filteredResults.indexOf(_weakestSigning);
-      filteredResults.splice(idx,1,{driver:star,team,reason:'Star driver guarantee — displaced a weaker signing'});
+      filteredResults.splice(idx,1,{driver:star,team,reason:'',_isRecruit:false,_isOwnDriver:false});
       signedIds.delete(_weakestSigning.driver.id);
       signedIds.add(star.id);
       remainingPool=remainingPool.filter(f=>f.id!==star.id);
@@ -7351,32 +7739,26 @@ function eosComputeSignings(){
   }
   // Holdout detection: a driver considered by more than one team as a genuine candidate,
   // but signed with only one, is treated as having actively chosen that team over the
-  // other(s). Scales the resulting modifier with driver strength — a stronger driver's
-  // choice/rejection carries more weight than a weak one's.
+  // other(s). Only meaningful for positive-modifier drivers — a -4.69 driver appearing
+  // in two weak teams' shortlists isn't a bidding war, it's just shared desperation.
+  // No modifier effects (team bonuses/penalties, relationship hits) fire for weak drivers.
   const holdouts=[];
-  const _rejectionPenalizedTeams=new Set(); // caps the rejection penalty at one per team per EoS cycle
+  const _rejectionPenalizedTeams=new Set();
   filteredResults.forEach(r=>{
     const driverId=r.driver.id||r.driver.pid;
+    const dMod=(r.driver.driverBonus||r.driver.db||0)+(getDriverMod(driverId)||0);
+    // Holdout mechanics only for positive-modifier drivers
+    if(dMod<=0)return;
     const consideredBy=driverConsideredByTeams[driverId];
     if(!consideredBy||consideredBy.size<=1)return;
     const rejectedTeams=[...consideredBy].filter(t=>t!==r.team);
     if(!rejectedTeams.length)return;
-    const dMod=(r.driver.driverBonus||r.driver.db||0)+(getDriverMod(driverId)||0);
     const _scaleFactor=1+Math.max(0,dMod)*0.10;
     const chosenBonus=Math.round(0.10*_scaleFactor*100)/100;
     applyTeamMod(r.team,chosenBonus);
     recordMod('team',null,teamDisplayName(r.team),chosenBonus,`Holdout signing — ${driverFullName(r.driver)||r.driver.name} chose this team`,'signing');
     applyDriverTeamRelation(driverId,r.team,6,'Chose this team in a bidding war');
     const rejectedPenalty=-Math.round(0.10*_scaleFactor*100)/100;
-    // Only apply the rejection penalty to a team once per EoS cycle — a team passed over
-    // by several different holdout drivers shouldn't stack a separate penalty for each one.
-    // (The relationship hit below is per driver-team pair, so it isn't capped the same way —
-    // each driver's own relationship with a team they personally rejected takes the hit
-    // regardless of how many other drivers also passed on that team this cycle.)
-    // Relationship-specific scaling for the rejection sting below: a team isn't nearly as
-    // offended by a lowly driver passing them over as by a genuinely strong one doing so.
-    // Floored so it never fully vanishes, uncapped on the top end so an elite snub can sting
-    // more than the -6 baseline.
     const _rejectRelScale=Math.max(0.15,0.5+dMod*0.15);
     rejectedTeams.forEach(t=>{
       applyDriverTeamRelation(driverId,t,-6*_rejectRelScale,'Rejected this team in a bidding war');
@@ -7386,41 +7768,69 @@ function eosComputeSignings(){
       applyTeamMod(t,rejectedPenalty);
       recordMod('team',null,teamDisplayName(t),rejectedPenalty,`Holdout signing — ${driverFullName(r.driver)||r.driver.name} chose another team`,'signing');
     });
-    holdouts.push({
-      driverId,driverName:driverFullName(r.driver)||r.driver.name,
-      chosenTeam:r.team,rejectedTeams,
-    });
+    holdouts.push({driverId,driverName:driverFullName(r.driver)||r.driver.name,chosenTeam:r.team,rejectedTeams});
   });
+  // Final cap enforcement: star-guarantee, fallback fill, and holdout swaps all modify
+  // filteredResults after the initial cap filter ran. Simple per-team count — the
+  // all-seats-open architecture means every driver (re-sign, recruit, fresh signing) has
+  // an entry in filteredResults, so no pre-seeding from movements/holdovers is needed.
+  const _finalCapCount={};
+  filteredResults=filteredResults.filter(s=>{
+    const max=isOneDriverTeam(s.team,eos.nextYear)?1:2;
+    _finalCapCount[s.team]=(_finalCapCount[s.team]||0)+1;
+    return _finalCapCount[s.team]<=max;
+  });
+
   eos._holdouts=holdouts;
+  // Present signings grouped by team (strongest to weakest) rather than the interleaved
+  // round-by-round order they were actually decided in — the competitive process above
+  // (contests, holdouts, recruiting) still runs exactly the same in the background either
+  // way; this only changes the order the already-finalized results get revealed in.
+  const _teamRevealOrder=new Map(sorted.map((t,i)=>[t,i]));
+  const _driverMod2=f=>(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);
+  filteredResults.sort((a,b)=>{
+    const teamDiff=(_teamRevealOrder.get(a.team)??999)-(_teamRevealOrder.get(b.team)??999);
+    if(teamDiff!==0)return teamDiff;
+    // Within same team: higher-modifier driver reveals first so #2 can decide
+    return _driverMod2(b.driver)-_driverMod2(a.driver);
+  });
   eos.signings=filteredResults;
   eos._signingDebugLog=signingDebugLog;
+  eos._signingNotes=_signingNotes;
+  // Genuinely-unsigned remainder: every pool candidate who ended up with NO signing entry
+  // anywhere. The render-side 'unsigned drivers' display needs this stored explicitly — it
+  // can't be derived from the signings array, since these are by definition the drivers
+  // absent from it.
+  // Genuinely-unsigned remainder: every pool candidate who ended up with NO signing entry
+  // anywhere — built from signedIds (from filteredResults after all placement paths including
+  // star-guarantee) rather than usedIds (only the queue loop), so a driver placed via the
+  // guarantee is correctly excluded rather than shown as still unsigned.
+  const _signedIdsForPool=new Set((eos.signings||[]).map(s=>s.driver.id||s.driver.pid).filter(Boolean));
+  const _unsignedSeen=new Set();
+  eos._unsignedPool=uniquePool.filter(f=>{
+    const fid=f.id||f.pid;
+    if(!fid||_signedIdsForPool.has(fid)||_signedIdsForPool.has(f.pid||fid))return false;
+    if(retiringIds.has(fid))return false;
+    if(_unsignedSeen.has(fid))return false;
+    _unsignedSeen.add(fid);
+    return true;
+  });
 }
 function eosRenderSignings(){
-  const eos=app._eos;const isDone=eos.stagesDone.has(5);
+  const eos=app._eos;const isDone=eos.stagesDone.has(4);
   eosComputeSignings();
   const signings=eos.signings||[];
   const closedTeams=new Set(eos.closures);
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
+  // Include BOTH runtime ids AND pids — FREE_AGENTS entries use pid, BASE_DRIVERS use
+  // the runtime id assigned at game start. A mismatch means a retiring driver's pid
+  // can pass the !retiringIds.has(fid) check in rawFreeAgents, leaking them into the pool.
+  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).flatMap(r=>[r.d.id,r.d.pid].filter(x=>x!=null)));
   const movedMap=new Map();
   (eos.movements||[]).filter(m=>m.approved!==false).forEach(m=>movedMap.set(m.d.id,m));
   const activeTeams=[...new Set(BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._careerEndingInjury&&!d._temp).map(d=>d.team))].filter(t=>!closedTeams.has(t));
   // Add confirmed new teams from Stage 3 (they have no drivers yet — need 2 each)
   const newTeamNames=(eos.confirmedNewTeams||[]).filter(t=>!closedTeams.has(t)&&!activeTeams.includes(t));
   newTeamNames.forEach(t=>activeTeams.push(t));
-  const rosterByTeam={};
-  activeTeams.forEach(t=>{
-    const existing=BASE_DRIVERS.filter(d=>d.team===t&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)).filter(d=>{
-      const mv=movedMap.get(d.id);return !mv||mv.to===t;
-    });
-    // Also include drivers arriving via upgrade movement (they're at a different team in BASE_DRIVERS)
-    const arriving=BASE_DRIVERS.filter(d=>d.team!==t&&!d._retired&&!d._careerEndingInjury&&!d._temp&&!retiringIds.has(d.id)&&movedMap.get(d.id)?.to===t);
-    const proposed=signings.filter(s=>s.team===t);
-    const totalDrivers=[...existing,...arriving,...(isDone?[]:proposed)];
-    const total=totalDrivers.length;
-    const maxS=newTeamNames.includes(t)?2:(isOneDriverTeam(t, eos.nextYear)?1:2);
-    rosterByTeam[t]={team:t,existing:[...existing,...arriving],proposed:isDone?[]:proposed,total,maxS};
-  });
-  const contractedIds2=new Set(BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp).map(d=>d.id));
   // autoConfirmSignings=false (default) → sequential one-by-one reveal
   // autoConfirmSignings=true → show all signings at once, skip reveal
   const showAllAtOnce=!!(app.realism?.autoConfirmSignings);
@@ -7432,24 +7842,39 @@ function eosRenderSignings(){
       ?signings.map(s=>s.driver.id||s.driver.pid).filter(Boolean)
       :signings.slice(0,(eos._revealedSignings||0)).map(s=>s.driver.id||s.driver.pid).filter(Boolean)
   );
-  const _upgradeMvIds=new Set((eos.movements||[]).filter(m=>m.approved!==false&&m.to).map(m=>m.d.id));
-  const _stayingIds=new Set(BASE_DRIVERS
-    .filter(d=>d.team!=='Available'&&!d._retired&&!d._temp&&!retiringIds.has(d.id))
-    .filter(d=>{const mv=(eos.movements||[]).find(m=>m.d.id===d.id&&m.approved!==false);return !mv||mv.to===d.team;})
-    .flatMap(d=>[d.id,d.pid].filter(Boolean)));
-  const _faPoolIds=new Set((app._seasonFAPool||[]).map(f=>f.id||f.pid).filter(Boolean));
+  // Build rosterByTeam from the final, swap-resolved signings (built AFTER holdout swaps
+  // above have been applied, so .team on each entry reflects the final destination).
+  // Previously built from activeTeams before swaps were applied, so a swapped signing
+  // would appear in the wrong team's row — the visible cause of "Coloni signs Raphanel
+  // but he doesn't appear in the Coloni row".
+  const rosterByTeam={};
+  activeTeams.forEach(t=>{
+    const maxS=newTeamNames.includes(t)?2:(isOneDriverTeam(t,eos.nextYear)?1:2);
+    rosterByTeam[t]={team:t,existing:[],arriving:[],proposed:[],total:0,maxS};
+  });
+  // Single pass over signings (already in final swap-resolved state) grouped by their
+  // final .team — covers own-driver re-signs, recruits, and free-agent signs uniformly.
+  signings.filter(s=>!s._skipped).forEach(s=>{
+    if(!rosterByTeam[s.team])return;
+    rosterByTeam[s.team].total++;
+    const rd=rosterByTeam[s.team];
+    // Classify for display purposes based on tag + reveal state
+    if(s._isOwnDriver)rd.existing.push(s);
+    else if(s._isRecruit)rd.arriving.push(s);
+    else rd.proposed.push(s);
+  });
+  // Every driver's eventual fate this cycle is a signings entry — own-team re-sign, recruit,
+  // or fresh free-agent sign. The pool below is simply 'everyone not yet revealed', so it
+  // genuinely starts full (including drivers who'll turn out to be staying with their own
+  // team) and only shrinks one at a time as each signing, whatever type it is, gets revealed.
+  const _availSeen=new Set();
   const allAvail=[
-    ...(app._seasonFAPool||[]),
-    ...(getSeasonFreeAgents(eos.year)),
-    ...BASE_DRIVERS.filter(d=>d.team==='Available'&&!d._retired&&!retiringIds.has(d.id)),
-    ...(eos.closures||[]).flatMap(t=>BASE_DRIVERS.filter(d=>d.team===t&&!d._retired&&!retiringIds.has(d.id))),
-    ...BASE_DRIVERS.filter(d=>{const mv=(eos.movements||[]).find(m=>m.d.id===d.id&&m.approved!==false);return mv&&!mv.to&&!retiringIds.has(d.id);}),
+    ...signings.filter(s=>!s._skipped&&!_revealedSignedIds.has(s.driver.id||s.driver.pid)).map(s=>s.driver),
+    ...(eos._unsignedPool||[]),
   ].filter(f=>{
-    const fid=f.id||f.pid;if(!fid)return false;
-    if(retiringIds.has(fid))return false;
-    if(_revealedSignedIds.has(fid)||_revealedSignedIds.has(f.pid||fid))return false;
-    if(_upgradeMvIds.has(fid))return false;
-    if(!_faPoolIds.has(fid)&&(_stayingIds.has(fid)||_stayingIds.has(f.pid||fid)))return false;
+    const fid=f.id||f.pid;
+    if(!fid||_availSeen.has(fid))return false;
+    _availSeen.add(fid);
     return true;
   });
   allAvail.sort((a,b)=>(a.lastName||a.ln||a.name||'').localeCompare(b.lastName||b.ln||b.name||''));
@@ -7469,14 +7894,19 @@ function eosRenderSignings(){
     const dName=((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||'')).trim();
     const mod=(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);
     const modStr=(mod>=0?'+':'')+mod.toFixed(2);
+    const _sourceTag=latestSigning._isRecruit?`from ${teamDisplayName(latestSigning._donorTeam)}`:latestSigning._isOwnDriver?'Re-signed':'Free Agent';
+    const _sigReason=latestSigning.reason&&latestSigning.reason!=='end-of-season signing'&&latestSigning.reason!=='Re-signed'?latestSigning.reason:'';
+    const _dNotes=(eos._signingNotes||{})[f.id||f.pid]||[];
     return`<div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:12px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px">
       <span style="font-size:22px">✅</span>
-      <div><div style="font-weight:700;font-size:15px">${flagImg(n2)} ${escapeHtml(dName)} <span style="color:#166534;font-weight:400;font-size:12px">${modStr}</span></div>
-      <div style="font-size:12px;color:#166534">signed with <strong>${escapeHtml(teamDisplayName(latestSigning.team))}</strong> &nbsp;·&nbsp; ${revealed} of ${signings.length}</div></div>
+      <div><div style="font-weight:700;font-size:15px">${escapeHtml(teamDisplayName(latestSigning.team))} signs ${flagImg(n2)} ${escapeHtml(dName)} <span style="color:#166534;font-weight:400;font-size:12px">${modStr}</span> <span style="color:var(--muted);font-weight:400;font-size:12px">(${escapeHtml(_sourceTag)})</span></div>
+      ${_sigReason?`<div style="font-size:12px;color:#374151;margin-top:2px">📋 ${escapeHtml(_sigReason)}</div>`:''}
+      ${_dNotes.length?`<div style="font-size:12px;color:#374151;margin-top:2px">${_dNotes.map(n=>`💬 ${escapeHtml(n)}`).join('<br>')}</div>`:''}
+      <div style="font-size:12px;color:#166534">${revealed} of ${signings.length}</div></div>
     </div>`;
   })();
   return eosReadOnlyWrap(`
-  <div class="eos-header"><div class="eos-tag">Stage 5 of 6</div><h2>Free Agent Signings</h2>
+  <div class="eos-header"><div class="eos-tag">Stage 5 of 5</div><h2>Free Agent Signings</h2>
     <p style="color:var(--muted);font-size:13px">${isDone?`${signings.length} signing(s) completed.`:showAllAtOnce?`${signings.length} signing(s) proposed.`:`Signing drivers into teams with vacancies. Click to reveal each signing.`}</p></div>
   <div class="btn-row">
     ${isDone?'<span class="tag" style="background:#dcfce7;color:#166534;padding:6px 12px">✓ Confirmed</span>':`
@@ -7484,14 +7914,24 @@ function eosRenderSignings(){
       ?`<button class="btn" onclick="eos_revealNextSigning()">Reveal next signing →</button>
          <button class="ghost" onclick="eos_revealAllSignings()">Complete signings →</button>`
       :`<button class="btn" onclick="eosConfirmSignings()">Confirm roster →</button>`}
-    <button class="ghost" onclick="app._eos.signings=null;app._eos._revealedSignings=0;renderEndOfSeason()">↺ Re-generate</button>
+    <button class="ghost" onclick="const e=app._eos;e.signings=null;e._revealedSignings=0;e._signingNotes={};e._signingDebugLog=[];e._unsignedPool=[];e._holdouts=[];renderEndOfSeason()">↺ Re-generate</button>
     ${!isDone&&(app.realism?.allowEditLineup!==false)?`<button class="ghost" onclick="eos_showEditRoster()">✏️ Edit roster…</button>`:''}`}
   </div>
   ${latestBanner}
   ${(()=>{
     if(!availPool.length)return'';
-    const _top5Avail=[...availPool].map(f=>({f,mod:(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0)})).sort((a,b)=>b.mod-a.mod).slice(0,5);
-    return`<div class="panel" style="margin-bottom:10px"><h4 style="margin:2px 0 6px">Top 5 remaining free agents</h4>
+    const _genuinelyUnsignedSeen=new Set();
+    const _genuinelyUnsigned=[
+      ...signings.filter(s=>!s._skipped&&!_revealedSignedIds.has(s.driver.id||s.driver.pid)).map(s=>s.driver),
+      ...(eos._unsignedPool||[]),
+    ].filter(f=>{
+      const fid=f.id||f.pid;
+      if(!fid||_genuinelyUnsignedSeen.has(fid))return false;
+      _genuinelyUnsignedSeen.add(fid);
+      return !_revealedSignedIds.has(fid);
+    });
+    const _top5Avail=[..._genuinelyUnsigned].map(f=>({f,mod:(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0)})).sort((a,b)=>b.mod-a.mod).slice(0,10);
+    return`<div class="panel" style="margin-bottom:10px"><h4 style="margin:2px 0 6px">Top 10 unsigned drivers</h4>
       <div style="display:flex;flex-wrap:wrap;gap:6px">${_top5Avail.map(({f,mod})=>{
         const n2=f.nation2||f.n2||'';
         const dName=((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||'')).trim();
@@ -7507,20 +7947,25 @@ function eosRenderSignings(){
   </div>`:''}
   <div class="session-banner" style="cursor:default">Pool: ${availPool.length} available · ${isDone||showAllAtOnce?signings.length:revealed}/${signings.length} signing(s) revealed</div>
   ${availPool.length?`<div class="sec" style="margin-top:10px">Available driver pool (${availPool.length})</div>
-  <div style="margin-bottom:10px">${availPool.map(f=>`<span style="display:inline-block;font-size:12px;margin:2px 4px;padding:2px 8px;background:var(--surface);border:1px solid var(--line);border-radius:4px">${flagImg(f.nation2||f.n2||'')} ${escapeHtml((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||''))}</span>`).join('')}</div>`:'<div style="font-size:13px;color:#15803d;margin-top:10px;margin-bottom:10px">✓ All drivers placed.</div>'}
+  <div style="margin-bottom:10px">${availPool.map(f=>{return`<span style="display:inline-block;font-size:12px;margin:2px 4px;padding:2px 8px;background:var(--surface);border:1px solid var(--line);border-radius:4px">${flagImg(f.nation2||f.n2||'')} ${escapeHtml((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||''))}</span>`;}).join('')}</div>`:'<div style="font-size:13px;color:#15803d;margin-top:10px;margin-bottom:10px">✓ All drivers placed.</div>'}
   <div class="two-col">
-  ${Object.values(rosterByTeam).map(({team,existing,proposed,total,maxS})=>{
-    // Sequential mode: only show signings up to revealed count; showAllAtOnce: show all
-    const visibleProposed=!showAllAtOnce&&!isDone?proposed.filter(s=>signings.indexOf(s)<revealed):proposed;
-    const visibleTotal=existing.length+visibleProposed.length;
+  ${Object.values(rosterByTeam).map(({team,existing,arriving,proposed,total,maxS})=>{
+    const allSigningsForTeam=[...existing,...arriving,...proposed];
+    // Show only up to the reveal watermark
+    const visibleSignings=!showAllAtOnce&&!isDone
+      ?allSigningsForTeam.filter(s=>signings.indexOf(s)<revealed)
+      :allSigningsForTeam;
+    const revealedExisting=visibleSignings.filter(s=>s._isOwnDriver).map(s=>s.driver);
+    const revealedArriving=visibleSignings.filter(s=>s._isRecruit||(!s._isOwnDriver&&!s._isRecruit)).map(s=>s.driver);
+    const visibleTotal=visibleSignings.length;
     const disp=teamDisplayName(team);
     const ttmVal=(teamBaseTb(team)||0)+(getTeamMod(team)||0);
     const modStr=(ttmVal>=0?'+':'')+ttmVal.toFixed(2);
     return`<div class="panel"><div style="display:flex;justify-content:space-between;margin-bottom:6px">
       <span style="font-weight:600">${escapeHtml(disp)}</span>
       <span style="font-size:12px;color:var(--muted)">${modStr}</span></div>
-    ${existing.map(d=>{const mv=movedMap.get(d.id);const isUpgrade=mv&&mv.type==='upgrade';const mod=(d.driverBonus||0)+(getDriverMod(d.id)||0);return`<div style="font-size:12px;padding:2px 0;color:${isUpgrade?'#92400e':'inherit'}">${isUpgrade?'↗ ':''}${flagImg(d.nation2)} ${escapeHtml(driverFullName(d))} <span style="color:var(--muted)">${(mod>=0?'+':'')+mod.toFixed(2)}</span></div>`;}).join('')}
-    ${visibleProposed.map(s=>{const f=s.driver;const mod=(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);const n2=f.nation2||f.n2||'';return`<div style="font-size:12px;padding:2px 0;color:#15803d">+ ${flagImg(n2)} ${escapeHtml((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||''))} <span style="color:var(--muted)">${(mod>=0?'+':'')+mod.toFixed(2)}</span></div>`;}).join('')}
+    ${revealedExisting.map(d=>{const mod=(d.driverBonus||0)+(getDriverMod(d.id)||0);return`<div style="font-size:12px;padding:2px 0">${flagImg(d.nation2)} ${escapeHtml(driverFullName(d))} <span style="color:var(--muted)">${(mod>=0?'+':'')+mod.toFixed(2)}</span></div>`;}).join('')}
+    ${revealedArriving.map(f=>{const mod=(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);const n2=f.nation2||f.n2||'';return`<div style="font-size:12px;padding:2px 0;color:#15803d">+ ${flagImg(n2)} ${escapeHtml((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||''))} <span style="color:var(--muted)">${(mod>=0?'+':'')+mod.toFixed(2)}</span></div>`;}).join('')}
     ${visibleTotal<maxS&&(showAllAtOnce||isDone||revealed>=signings.length)?`<div style="color:#dc2626;font-size:11px;margin-top:3px">⚠ ${maxS-visibleTotal} vacant</div>`:''}
     </div>`;
   }).join('')}
@@ -7538,25 +7983,48 @@ window.eos_revealAllSignings=function(){
 };
 window.eosConfirmSignings=function(){
   const eos=app._eos;
-  (eos.signings||[]).forEach(s=>{
+  // The double-booked guard has been removed. Under the unified signing system every driver
+  // in eos.signings arrived via one of: free-agent pool (excluded from contracted set),
+  // _isOwnDriver retention, _isRecruit from another team, or not-retained release into the
+  // pool. All legitimate paths — a spurious double-booking cannot occur, and the guard was
+  // producing false positives (e.g. Senna to Williams skipped because his McLaren entry
+  // still existed in BASE_DRIVERS at confirm time, before movements had run).
+  (eos.signings||[]).filter(s=>!s._skipped&&!s._isOwnDriver).forEach(s=>{
     const name=(s.driver.firstName||s.driver.fn||'')+' '+(s.driver.lastName||s.driver.ln||s.driver.name||'');
-    eosLog(`SIGNED: ${name} → ${teamDisplayName(s.team)}`,5);
     const _holdout=(eos._holdouts||[]).find(h=>h.driverId===(s.driver.id||s.driver.pid));
     const _reason=_holdout
-      ?`Holdout — chose ${teamDisplayName(s.team)} over ${_holdout.rejectedTeams.map(t=>teamDisplayName(t)).join(', ')}`
+      ?`Chose ${teamDisplayName(s.team)} over ${_holdout.rejectedTeams.map(t=>teamDisplayName(t)).join(', ')}`
       :(s.reason||'end-of-season signing');
-    recordDriverMovement(s.driver.id,'hired',null,s.team,_reason,0,eos.year||app.currentSeason,name.trim());
-    // Driver-team relationship: mark the start of this pairing — holdout signings already got
-    // their own chose/rejected events back in eosComputeSignings, so skip those here to avoid
-    // double-applying a 'joined' event on top of the holdout-specific one for the same signing.
-    if(!_holdout){
-      const driverId=s.driver.id||s.driver.pid;
-      const dMod=(s.driver.driverBonus||s.driver.db||0)+(getDriverMod(driverId)||0);
-      const stepUp=(teamBaseTb(s.team)||0)-dMod;
-      if(stepUp>1.0){
-        applyDriverTeamRelation(driverId,s.team,Math.min(8,4+stepUp*1.5),'Given a chance at a bigger team');
-      } else {
-        applyDriverTeamRelation(driverId,s.team,3,`Signed for ${eos.nextYear||app.currentSeason}`);
+    const _sMod=(s.driver.driverBonus||s.driver.db||0)+(getDriverMod(s.driver.id||s.driver.pid)||0);
+    const _sModStr=(_sMod>=0?'+':'')+_sMod.toFixed(2);
+    const _sSourceTag=s._isRecruit?`from ${teamDisplayName(s._donorTeam)}`:'Free Agent';
+    eosLog(`SIGNED: ${teamDisplayName(s.team)} signs ${name.trim()} ${_sModStr} (${_sSourceTag})${_reason!=='end-of-season signing'?` — ${_reason}`:''}`,5);
+    const driverId=s.driver.id||s.driver.pid;
+    if(s._isRecruit){
+      // Recruited from another team, not signed from the free-agent pool — correct movement
+      // record (transferred, not hired from nowhere), a rivalry seed between the two teams,
+      // and the recruit-specific relationship events (mirrors the old standalone poaching
+      // mechanism this replaced).
+      recordDriverMovement(driverId,'transferred',s._donorTeam,s.team,_reason,0,eos.year||app.currentSeason,name.trim());
+      addTeamRivalryPoints(s.team,s._donorTeam,Math.floor(Math.random()*26)+15,'Driver recruited from rival team',null);
+      const driverBoost=Math.round((0.10+Math.random()*0.10)*100)/100;
+      applyDriverMod(driverId,driverBoost);
+      recordMod('driver',driverId,name.trim(),driverBoost,'Recruited by a rival team at end of season','signing');
+      applyDriverTeamRelation(driverId,s._donorTeam,-Math.random()*10,'Recruited away at end of season');
+      applyDriverTeamRelation(driverId,s.team,6,'Recruited by this team at end of season');
+    } else {
+      recordDriverMovement(driverId,'hired',null,s.team,_reason,0,eos.year||app.currentSeason,name.trim());
+      // Driver-team relationship: mark the start of this pairing — holdout signings already
+      // got their own chose/rejected events back in eosComputeSignings, so skip those here to
+      // avoid double-applying a 'joined' event on top of the holdout-specific one.
+      if(!_holdout){
+        const dMod=(s.driver.driverBonus||s.driver.db||0)+(getDriverMod(driverId)||0);
+        const stepUp=(teamBaseTb(s.team)||0)-dMod;
+        if(stepUp>1.0){
+          applyDriverTeamRelation(driverId,s.team,Math.min(8,4+stepUp*1.5),'Given a chance at a bigger team');
+        } else {
+          applyDriverTeamRelation(driverId,s.team,3,`Signed for ${eos.nextYear||app.currentSeason}`);
+        }
       }
     }
   });
@@ -7565,7 +8033,10 @@ window.eosConfirmSignings=function(){
 };
 window.eos_showEditRoster=function(){
   const eos=app._eos;if(!eos)return;
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
+  // Include BOTH runtime ids AND pids — FREE_AGENTS entries use pid, BASE_DRIVERS use
+  // the runtime id assigned at game start. A mismatch means a retiring driver's pid
+  // can pass the !retiringIds.has(fid) check in rawFreeAgents, leaking them into the pool.
+  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).flatMap(r=>[r.d.id,r.d.pid].filter(x=>x!=null)));
   const closedTeams=new Set(eos.closures);
   const movedDrivers=new Map();
   (eos.movements||[]).filter(m=>m.approved!==false).forEach(m=>movedDrivers.set(m.d.id,{type:m.type,to:m.to}));
@@ -7653,13 +8124,16 @@ window.eos_editRosterSave=function(){
 
 // ── Stage 6: Complete + Apply ──────────────────────────────────────
 function eosRenderComplete(){
-  const eos=app._eos;const isDone=eos.stagesDone.has(6);
+  const eos=app._eos;const isDone=eos.stagesDone.has(5);
   const st=eos._standingsCache;
   const dChamp=st.driverChampion||st.drivers[0]?.name||'—';
   const cChamp=st.teamChampion||teamDisplayName(st.teams[0]?.name||'—')||'—';
 
   // ── Build roster summary: team → {stays, leaves, joins} ──────────
-  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).map(r=>r.d.id));
+  // Include BOTH runtime ids AND pids — FREE_AGENTS entries use pid, BASE_DRIVERS use
+  // the runtime id assigned at game start. A mismatch means a retiring driver's pid
+  // can pass the !retiringIds.has(fid) check in rawFreeAgents, leaking them into the pool.
+  const retiringIds=new Set(eos.retirements.filter(r=>!r.override).flatMap(r=>[r.d.id,r.d.pid].filter(x=>x!=null)));
   const closedTeams=new Set(eos.closures);
   const approvedMvs=(eos.movements||[]).filter(m=>m.approved!==false);
   const movedOut=new Map(); // id → {type,to,from}
@@ -7669,9 +8143,12 @@ function eosRenderComplete(){
     if(m.to){if(!movedIn.has(m.to))movedIn.set(m.to,[]);movedIn.get(m.to).push(m);}
   });
   const signingsByTeam=new Map();
-  (eos.signings||[]).forEach(s=>{
+  const allSignedIds=new Set();
+  (eos.signings||[]).filter(s=>!s._skipped).forEach(s=>{
     if(!signingsByTeam.has(s.team))signingsByTeam.set(s.team,[]);
-    signingsByTeam.get(s.team).push(s.driver);
+    signingsByTeam.get(s.team).push(s);
+    const _sid=s.driver.id||s.driver.pid;
+    if(_sid!=null)allSignedIds.add(_sid);
   });
 
   // All teams for next year (existing minus closed, plus new entries)
@@ -7680,31 +8157,40 @@ function eosRenderComplete(){
   const allNextTeams=[...existingTeams,...newTeamNames].sort((a,b)=>a.localeCompare(b));
 
   const gr=eos.gridRules||{};
-  // Count projected drivers
   let totalDrivers=0;
   const teamRows=allNextTeams.map(team=>{
     const isNew=newTeamNames.includes(team);
     const disp=teamDisplayName(team);
-    const stays=isNew?[]:BASE_DRIVERS.filter(d=>d.team===team&&!d._retired&&!d._temp&&!retiringIds.has(d.id)).filter(d=>{
-      const mv=movedOut.get(d.id);return !mv||mv.to===team;
-    });
+    // The signings array is the authoritative source for next season's roster.
+    // Own-driver re-signs, recruits from other teams, and fresh free-agent signings
+    // all live there — no need to mix in BASE_DRIVERS team fields (which are stale).
+    const teamSignings=signingsByTeam.get(team)||[];
     const retires=isNew?[]:BASE_DRIVERS.filter(d=>d.team===team&&!d._temp&&retiringIds.has(d.id));
-    const leaves=isNew?[]:BASE_DRIVERS.filter(d=>d.team===team&&!d._retired&&!d._temp&&!retiringIds.has(d.id)).filter(d=>{
-      const mv=movedOut.get(d.id);return mv&&!mv.to; // released/left
+    const leaves=isNew?[]:BASE_DRIVERS.filter(d=>d.team===team&&!d._retired&&!d._temp
+      &&!retiringIds.has(d.id)&&!allSignedIds.has(d.id)).filter(d=>{
+      const mv=movedOut.get(d.id);return mv&&!mv.to;
     });
-    const promoted=(movedIn.get(team)||[]).map(m=>m.d); // moves in from other teams
-    const signed=signingsByTeam.get(team)||[];
-    const total=stays.length+promoted.length+signed.length;
+    const total=teamSignings.length;
     totalDrivers+=total;
     const maxS=isNew?2:(isOneDriverTeam(team,eos.nextYear)?1:2);
     const shortage=maxS-total;
-    const fn=d=>driverFullName(d)||d.name||d.ln||'?';
+    const fn=f=>{
+      const d=f.driver||f;
+      return driverFullName(d)||d.name||d.ln||'?';
+    };
     const rows=[];
-    stays.forEach(d=>rows.push(`<div style="font-size:11px;padding:1px 0">${flagImg(d.nation2)} ${escapeHtml(fn(d))}</div>`));
-    promoted.forEach(d=>rows.push(`<div style="font-size:11px;padding:1px 0;color:#1d4ed8">↗ ${flagImg(d.nation2)} ${escapeHtml(fn(d))}</div>`));
-    signed.forEach(f=>{const n=(f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||'');rows.push(`<div style="font-size:11px;padding:1px 0;color:#15803d">+ ${flagImg(f.nation2||f.n2||'')} ${escapeHtml(n.trim())}</div>`);});
-    retires.forEach(d=>rows.push(`<div style="font-size:11px;padding:1px 0;color:#9f1239;text-decoration:line-through">⛔ ${flagImg(d.nation2)} ${escapeHtml(fn(d))}</div>`));
-    leaves.forEach(d=>rows.push(`<div style="font-size:11px;padding:1px 0;color:#92400e">🚪 ${flagImg(d.nation2)} ${escapeHtml(fn(d))}</div>`));
+    teamSignings.forEach(s=>{
+      const f=s.driver;const n2=f.nation2||f.n2||'';const dname=fn(s);
+      if(s._isOwnDriver){
+        rows.push(`<div style="font-size:11px;padding:1px 0">${flagImg(n2)} ${escapeHtml(dname)}</div>`);
+      } else if(s._isRecruit){
+        rows.push(`<div style="font-size:11px;padding:1px 0;color:#1d4ed8">↗ ${flagImg(n2)} ${escapeHtml(dname)}</div>`);
+      } else {
+        rows.push(`<div style="font-size:11px;padding:1px 0;color:#15803d">+ ${flagImg(n2)} ${escapeHtml(dname)}</div>`);
+      }
+    });
+    retires.forEach(d=>rows.push(`<div style="font-size:11px;padding:1px 0;color:#9f1239;text-decoration:line-through">⛔ ${flagImg(d.nation2)} ${escapeHtml(driverFullName(d)||d.name||'?')}</div>`));
+    leaves.forEach(d=>rows.push(`<div style="font-size:11px;padding:1px 0;color:#92400e">🚪 ${flagImg(d.nation2)} ${escapeHtml(driverFullName(d)||d.name||'?')}</div>`));
     return`<div class="panel" style="margin-bottom:6px">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
         <span style="font-weight:600;font-size:13px">${escapeHtml(disp)}${isNew?'<span style="font-size:10px;color:#1d4ed8;margin-left:4px">NEW</span>':''}</span>
@@ -7721,7 +8207,7 @@ function eosRenderComplete(){
   </div>`);
 
   return`
-  <div class="eos-header"><div class="eos-tag">Stage 6 of 6</div><h2>${eos.nextYear} Season Grid</h2>
+  <div class="eos-header"><div class="eos-tag">Stage 6 of 5</div><h2>${eos.nextYear} Season Grid</h2>
     <p style="color:var(--muted);font-size:13px">${gr.label||''} rules: ${gr.minDrivers}–${gr.maxDrivers} drivers from ${gr.minTeams}–${gr.maxTeams} teams. Projected: <strong>${totalDrivers} drivers from ${allNextTeams.length} teams</strong>.</p></div>
   <div class="btn-row">
     ${isDone?`<button class="btn" style="background:#15803d" onclick="eosApplyAndBeginNewSeason()">🏁 Begin ${eos.nextYear} season →</button>
@@ -7832,6 +8318,10 @@ window.eosApplyAndBeginNewSeason=function(){
     const _retAge=(()=>{const _nyr=eos.nextYear||app.currentSeason+1;return _nyr-(r.d.dob||0)||'?';})();
     if(d){const rd=app._retiredDrivers.find(x=>x.id===d.id);if(rd){rd.firstName=rd.firstName||d.firstName||'';rd.lastName=rd.lastName||d.name||'';rd.nation2=rd.nation2||d.nation2||'';}}
     recordDriverIncident(r.d.id,'retired',{team:r.d.team||'',reason:r.reason,round:0,year:eos.year||app.currentSeason});
+    // Also record in the movement log — this is what feeds the 'Movement Log' button on the
+    // profile page; without this, retirements simply don't appear in a driver's career history.
+    const _retName=driverFullName(r.d)||r.d.name||'?';
+    recordDriverMovement(r.d.id,'retired',r.d.team||null,null,r.reason||'End of career',0,eos.year||app.currentSeason,_retName.trim());
     const _retStats=driverCareer(r.d.id)?.stats;
     if(qualifiesForCareerRetrospective(_retStats)){
       const _retName=driverFullName(r.d)||r.d.name||'?';
@@ -7888,6 +8378,17 @@ window.eosApplyAndBeginNewSeason=function(){
       _moveNews.push(`🚪 <strong>${escapeHtml(driverFullName(d))}</strong> leaves <strong>${escapeHtml(teamDisplayName(mv.from||'?'))}</strong>.`);
     }
   });
+  // Explicit not-retained pass: any contracted driver that is still in BASE_DRIVERS at their
+  // old team (team!=='Available') but has a 'not retained' release in eos.movements should
+  // definitely be released here. This handles id-form mismatches that could cause the
+  // movedDrivers map above to miss them, leaving them at their old team and inflating
+  // _holdoverCount for that team (the Moreno/Coloni bug where h=2 despite no real holdovers).
+  const _notRetainedMovementIds=new Set(
+    (eos.movements||[]).filter(m=>m.approved!==false&&!m.to&&m.reason==='Not retained — squad moved on').map(m=>m.d?.id).filter(x=>x!=null)
+  );
+  BASE_DRIVERS.filter(d=>_notRetainedMovementIds.has(d.id)&&d.team&&d.team!=='Available'&&!d._retired&&!d._temp).forEach(d=>{
+    d.team='Available';d._released=true;
+  });
 
   // 4. Team closures — record IDs permanently to prevent re-entry
   if(!app._closedTeamIds)app._closedTeamIds=[];
@@ -7926,11 +8427,90 @@ window.eosApplyAndBeginNewSeason=function(){
   });
   app._seasonFAPool=app._seasonFAPool||[];
   app._faCallupCount={};app._activeContracts={};
+  // Seat-cap accounting for the application loop below. The old gate counted live
+  // BASE_DRIVERS state per team — but a driver being recruited AWAY still sits at their old
+  // team until their own signing entry applies, so when a donor team's entries processed
+  // before the recruiter's, the donor's roster looked full, their genuine replacement
+  // signing was silently dropped as 'over cap', and THEN the recruit-away applied — leaving
+  // the team a driver short at season start despite a fully-confirmed roster. Prospective
+  // accounting instead: count holdovers (drivers at the team with no signing entry anywhere
+  // — defensive; under the unified process every continuing driver has one) plus signings
+  // actually applied so far in this loop.
+  // Build the authoritative set of all driver IDs whose fate is already decided this cycle
+  // — includes both explicit signings AND not-retained/release movements (which come from
+  // eos.movements, not eos.signings, but still mean the driver has vacated their BASE_DRIVERS
+  // seat and must not be counted as a holdover occupying it).
+  const _signedIdsAll=new Set([
+    ...(eos.signings||[]).filter(s=>!s._skipped).flatMap(s=>[s.driver.id,s.driver.pid]).filter(x=>x!=null&&x!==undefined),
+    ...(eos.movements||[]).filter(m=>m.approved!==false).flatMap(m=>[m.d?.id,m.d?.pid]).filter(x=>x!=null&&x!==undefined),
+  ]);
+  const _holdoverCount={};
+  const _holdoverDebug={}; // for overflow diagnostics
+  const _retiredIdsForHoldover=new Set((app._retiredDrivers||[]).map(r=>r.id).filter(x=>x!=null));
+  const _eosRetiringIds=new Set((eos.retirements||[]).filter(r=>!r.override).flatMap(r=>[r.d?.id,r.d?.pid]).filter(x=>x!=null));
+  BASE_DRIVERS.filter(d=>d.team&&d.team!=='Available'&&!d._retired&&!d._temp
+    &&!_signedIdsAll.has(d.id)&&!_signedIdsAll.has(d.pid)
+    &&!_retiredIdsForHoldover.has(d.id)&&!_eosRetiringIds.has(d.id)&&!_eosRetiringIds.has(d.pid)
+  ).forEach(d=>{
+    _holdoverCount[d.team]=(_holdoverCount[d.team]||0)+1;
+    if(!_holdoverDebug[d.team])_holdoverDebug[d.team]=[];
+    _holdoverDebug[d.team].push(`${driverFullName(d)||d.id}(id=${d.id},pid=${d.pid},inSigned=${_signedIdsAll.has(d.id)})`);
+  });
+  // Also count drivers who arrived via MOVEMENTS (not the signing process) — these are
+  // now at their new team in BASE_DRIVERS and would NOT appear in _holdoverCount (their id
+  // is in _signedIdsAll), but they DO occupy a seat that signing must not overfill.
+  // IMPORTANT: do NOT count _isRecruit signings here — recruits have a signing entry and
+  // will be counted via _appliedPerTeam. Counting them here too would double-count their
+  // seat and cause legitimate signings to be incorrectly dropped as 'over cap'.
+  const _recruitSignedIds=new Set((eos.signings||[]).filter(s=>s._isRecruit&&!s._skipped).map(s=>s.driver.id||s.driver.pid).filter(Boolean));
+  const _arrivingCount={};
+  (eos.movements||[]).filter(m=>m.approved!==false&&m.to).forEach(m=>{
+    const _mid=m.d?.id;
+    if(_mid==null)return;
+    if(_recruitSignedIds.has(_mid))return; // handled via _appliedPerTeam when their signing processes
+    const _bd=BASE_DRIVERS.find(d=>d.id===_mid);
+    if(_bd&&_bd.team===m.to)_arrivingCount[m.to]=(_arrivingCount[m.to]||0)+1;
+  });
+  const _appliedPerTeam={};
   (eos.signings||[]).forEach(s=>{
+    if(s._skipped)return; // double-booked entries flagged at confirm — never apply them
     const fa=s.driver;const team=s.team;
+    // Recruits: the driver is still physically at their donor team in BASE_DRIVERS because no
+    // movement record was created for them (only a signing entry with _isRecruit=true).
+    // Remove them from the donor holdoverCount before the seat cap check so the cap is
+    // accurate and the recruit's application isn't silently skipped.
+    if(s._isRecruit&&s._donorTeam){
+      const _donorBd=BASE_DRIVERS.find(d=>d.id===fa.id);
+      if(_donorBd&&teamCanonicalName(_donorBd.team)===teamCanonicalName(s._donorTeam)){
+        if(_holdoverCount[_donorBd.team]>0)_holdoverCount[_donorBd.team]--;
+      }
+    }
     const existing=BASE_DRIVERS.find(d=>d.id===fa.id);
     const maxS=isOneDriverTeam(team,eos.nextYear)?1:2;
-    if(BASE_DRIVERS.filter(d=>d.team===team&&!d._retired).length>=maxS)return;
+    const _capH=_holdoverCount[team]||0;
+    const _capA=_arrivingCount[team]||0;
+    const _capP=_appliedPerTeam[team]||0;
+    if(_capH+_capA+_capP>=maxS){
+      s._skipped=true;
+      const _dName=driverFullName(existing)||(fa.firstName||fa.fn||'')+' '+(fa.lastName||fa.ln||fa.name||'')||fa.id;
+      const _flags=[s._isOwnDriver&&'own',s._isRecruit&&'recruit',s._skipped&&'skipped'].filter(Boolean).join('/');
+      eosLog(`⚠ CAP OVERFLOW: ${_dName} → ${teamDisplayName(team)} (h=${_capH}[${(_holdoverDebug[team]||[]).join(',')||'none'}] a=${_capA} p=${_capP} max=${maxS} flags=${_flags||'fa'})`,6);
+      if(existing){
+        existing.team='Available';
+        existing._released=true;
+      } else {
+        // Not in BASE_DRIVERS yet — push a minimal Available entry so they show correctly
+        const _fn=fa.firstName||fa.fn||'';const _ln=fa.lastName||fa.ln||fa.name||'';
+        const db=fa.driverBonus||fa.db||0;
+        BASE_DRIVERS.push({id:fa.id,pid:fa.pid||fa.id,listOrder:39,firstName:_fn,lastName:_ln,name:_ln,
+          nation2:fa.nation2||fa.n2||'',nation3:fa.nation3||fa.n3||'',
+          team:'Available',dob:fa.dob||1970,driverBonus:db,teamBonus:0,qualiBonus:db,raceNoGridBonus:db,
+          preferredTeam:null,isFreeAgent:true,_temp:false,_released:true});
+        app._seasonFAPool=(app._seasonFAPool||[]).filter(f=>f.id!==fa.id);
+      }
+      return;
+    }
+    _appliedPerTeam[team]=(_appliedPerTeam[team]||0)+1;
     if(existing){
       const newTb2=teamBaseTb(team)||0;
       const newDb2=existing.driverBonus||0;
@@ -8051,7 +8631,31 @@ window.eosApplyAndBeginNewSeason=function(){
     });
   }
 
-  // Pre-season bonus: the positive mirror of the above — a team from -5.00 to +1.00
+  // No-points penalty: teams who racked up a lot of race starts without scoring any
+  // championship points take a modifier hit reflecting the negative public/sponsor perception.
+  // Base: -0.20 per 10 starts without a point, calibrated for a 32-start maximum (2 drivers
+  // × 16 rounds). Scales with actual season length and grid size so it behaves consistently
+  // across different years and team counts.
+  {
+    const _eosYear=eos?.year||app.currentSeason;
+    const _eosStandings=seasonStandings(_eosYear);
+    const _totalRoundsForPenalty=seasonRules(_eosYear).totalRounds||16;
+    // Maximum possible starts for any team in this season (2 drivers × total rounds)
+    const _maxStartsForPenalty=2*_totalRoundsForPenalty;
+    // Scale factor so the threshold stays proportional across different season lengths
+    const _startsPerPenalty=_maxStartsForPenalty*(10/32);
+    (_eosStandings.teams||[]).forEach(t=>{
+      if(t.championshipPoints>0)return; // scored at least one point — no penalty
+      if(t.starts<_startsPerPenalty)return; // not enough starts to trigger first threshold
+      const _tiers=Math.floor(t.starts/_startsPerPenalty);
+      const _penalty=-0.20*_tiers;
+      const _tCanon=teamCanonicalName(t.name);
+      applyTeamModEndOfSeason(_tCanon,_penalty,`${t.starts} race start${t.starts!==1?'s':''} without scoring a point`);
+      _preseasonPenaltyRows.push({team:_tCanon,delta:_penalty,reason:`${t.starts} starts, 0 points`});
+    });
+  }
+
+
   // whose drivers are collectively performing ABOVE their team's level (an underdog car
   // being carried by talent) gets a reward, scaling up the further below the range's top
   // the team sits (mirroring how the penalty above scales up the further above ITS
@@ -8250,9 +8854,21 @@ window.eosApplyAndBeginNewSeason=function(){
   const _storyRows=[..._storyRowsTeam,..._storyRowsDriver];
 
   // 8. Build news
+  // Store structured data for the start-of-season news redesign
+  app._pendingNews={
+    retirements:_retireNews||[],
+    driverStorylines:_storyRowsDriver||[],
+    teamMods:Object.entries(_teamModGrouped).map(([canon,entries])=>({
+      canon,
+      name:teamDisplayName(canon)||canon,
+      totalMod:(teamBaseTb(canon)||0)+(getTeamMod(canon)||0),
+      entries,
+    })).sort((a,b)=>b.totalMod-a.totalMod),
+  };
   const endNews={id:'season-end-'+oldSeason,type:'season-end',year:oldSeason,title:`${oldSeason} Season Review`,
     html:buildSeasonEndSummary(oldSeason,_retireNews,_moveNews,_storyRows,newSeason)};
   pushNews(endNews);
+  app._lastEos=app._eos; // preserve for diagnostic export after season starts
   app._eos=null;
   // Remove #end-of-season from nav history so Back never returns to EoS
   _navHistory.splice(0,_navHistory.length,..._navHistory.filter(h=>h!=='#end-of-season'));
@@ -8280,7 +8896,7 @@ function renderEndOfSeason(){
     eos.stagesDone=new Set(Array.isArray(eos.stagesDone)?eos.stagesDone:Object.keys(eos.stagesDone||{}).map(Number).filter(n=>!isNaN(n)));
   }
   const el=document.getElementById('routeProfile');if(!el)return;
-  const stageContent=eos.stage===0?eosRenderSettings():eos.stage===1?eosRenderRetirements():eos.stage===2?eosRenderEntrants():eos.stage===3?eosRenderTeamChanges():eos.stage===4?eosRenderMovements():eos.stage===5?eosRenderSignings():eosRenderComplete();
+  const stageContent=eos.stage===0?eosRenderSettings():eos.stage===1?eosRenderEntrants():eos.stage===2?eosRenderTeamChanges():eos.stage===3?eosRenderMovements():eos.stage===4?eosRenderSignings():eosRenderComplete();
   el.innerHTML=`<div class="card">
     <a class="back-link" href="#start" onclick="event.preventDefault();if(confirm('Exit end-of-season module? Progress is saved.')){app._eos=null;goHash('#start');}">← Cancel & return to game</a>
     <div style="margin:12px 0;display:flex;gap:0;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:10px">
@@ -8398,19 +9014,24 @@ function eosDebugRunFullEoS(debugLog){
     // Stage 0: save settings
     if(!eos.stagesDone.has(0)){eos.settings={overrideRetirements:false,allowRandomTeams:false};eos.stagesDone.add(0);eos.stage=1;}
 
-    // Stage 1: retirements — auto-roll
+    // Stage 1: new entrants — auto-confirm (retirements now computed inside Stage 3 Movements)
     if(!eos.stagesDone.has(1)){
-      eosComputeRetirements();
-      eos.retConfirmed=true;eos.stagesDone.add(1);eos.stage=2;
-    }
-
-    // Stage 2: new entrants — auto-confirm
-    if(!eos.stagesDone.has(2)){
+      eosComputeRetirements(); // pre-compute for use in eosComputeMovements below
+      // Flag every retiring driver BEFORE confirming — mirrors eosConfirmRetirements/
+      // eos_advancePhase. Without this, retConfirmed=true below short-circuits the
+      // flagging block inside eosComputeMovements (it only runs when !eos.retConfirmed),
+      // so retiring drivers would never be excluded from the voluntary-departure/release
+      // rolls or the free-agent signing pool.
+      eos.retirements.filter(r=>!r.override).forEach(r=>{
+        const bd=BASE_DRIVERS.find(x=>x.id===r.d.id);
+        if(bd)bd._pendingRetirement=true;
+      });
+      eos.retConfirmed=true;
       eosConfirmEntrants();
     }
 
-    // Stage 3: team changes — auto-roll closures if needed, then confirm
-    if(!eos.stagesDone.has(3)){
+    // Stage 2: team changes — auto-roll closures if needed, then confirm
+    if(!eos.stagesDone.has(2)){
       const gr=eos.gridRules||{maxTeams:20};
       const existingTeams=[...new Set(BASE_DRIVERS.filter(d=>d.team!=='Available'&&!d._retired&&!d._temp).map(d=>d.team))];
       const newCount=(eos.confirmedNewTeams||[]).filter(t=>!existingTeams.includes(t)).length;
@@ -8423,21 +9044,21 @@ function eosDebugRunFullEoS(debugLog){
       window.eosConfirmTeamChanges();
     }
 
-    // Stage 4: movements — auto-compute and confirm all
-    if(!eos.stagesDone.has(4)){
+    // Stage 3: movements (includes retirement display) — auto-compute and confirm all
+    if(!eos.stagesDone.has(3)){
       eosComputeMovements();
       (eos.movements||[]).forEach(m=>{if(m.approved===null)m.approved=true;});
-      eos.movementsConfirmed=true;eos.stagesDone.add(4);eos.stage=5;
+      eos.movementsConfirmed=true;eos.stagesDone.add(3);eos.stage=4;
     }
 
-    // Stage 5: signings — auto-compute and confirm
-    if(!eos.stagesDone.has(5)){
+    // Stage 4: signings — auto-compute and confirm
+    if(!eos.stagesDone.has(4)){
       eosComputeSignings();
-      eos.rosterConfirmed=true;eos.stagesDone.add(5);eos.stage=6;
+      eos.rosterConfirmed=true;eos.stagesDone.add(4);eos.stage=5;
     }
 
-    // Stage 6: confirm complete then apply
-    if(!eos.stagesDone.has(6)){
+    // Stage 5: confirm complete then apply
+    if(!eos.stagesDone.has(5)){
       window.eosConfirmComplete();
     }
 
@@ -8835,7 +9456,9 @@ function raceNewsTeamChanges(weekendEntry,round){
       const isQuit=f.action==='quit';
       const actionLabel=isQuit?'quits!':'fired!';
       const _reasonMap={'rivalry':'rivalry','poor-qualifying':'failed to qualify','reckless-driving':'performance issues','paddock-drama':'paddock drama','underperforming-teammate':'outperformed by teammate','teammate-frustration':'outperformed by teammate','top-team-underperformance':'underperforming a top team','very-poor-form':'prolonged loss of form','car-reliability-frustration':'car reliability frustration'};
-      const reasonLabel=f.reason&&f.reason!=='personal'?' ('+(_reasonMap[f.reason]||f.reason)+')':'';
+      const _baseReason=f.reason&&f.reason!=='personal'?(_reasonMap[f.reason]||f.reason):'';
+      const _rivalSuffix=(f.reason==='rivalry'&&f.rivalTeammateName)?` with ${escapeHtml(f.rivalTeammateName)}`:'';
+      const reasonLabel=_baseReason?` (${_baseReason}${_rivalSuffix})`:'';
       let line=`<li>${flagImg(f.nation2||'')} <strong>${escapeHtml(f.originalName)}</strong> ${actionLabel}${reasonLabel}`;
       if(f.replacementName){
         if(f.signedFromTeam){
@@ -9226,13 +9849,10 @@ function _scoringScaleForYear(year){
   return (_scoringSummaryForYear(year).points[0]||10)/10;
 }
 function buildSeasonStartNews(year){
-
   const sections=[];
 
-  // Welcome
   sections.push(`<p style="font-size:14px">Welcome to the <strong>${year} FIA Formula 1 World Championship!</strong></p>`);
 
-  // Defending champions — only show if previous season was actually played (has history)
   const prevSeasonRaces=app.history.weekends.filter(w=>w.raceMeta.year<year&&w.race.length>0);
   if(prevSeasonRaces.length>0){
     const prevSt=seasonStandings(year-1);
@@ -9240,7 +9860,6 @@ function buildSeasonStartNews(year){
     const cChamp=prevSt.teamChampion||(prevSt.teams[0]?.name||'—');
     sections.push(`<h4>Defending Champions</h4><p style="font-size:13px">Drivers: <strong>${escapeHtml(dChamp)}</strong> &nbsp;|&nbsp; Constructors: <strong>${escapeHtml(cChamp)}</strong></p>`);
 
-    // Scoring system change — only shown when it actually differs from last season
     const curScoring=_scoringSummaryForYear(year);
     const prevScoring=_scoringSummaryForYear(year-1);
     const scoringChanged=curScoring.points.join(',')!==prevScoring.points.join(',')||!!curScoring.bestN!==!!prevScoring.bestN||curScoring.fastestLap!==prevScoring.fastestLap;
@@ -9252,37 +9871,34 @@ function buildSeasonStartNews(year){
     }
   }
 
-  // Off-season random mod changes
-  const pendingMods=app._pendingNews?.offseasonMods||[];
-  if(pendingMods.length){
-    const modLines=pendingMods.map(m=>{
-      const sign=m.delta>0?'<span class="modifier-pos">'+fmtBonus(m.delta)+'</span>':'<span class="modifier-neg">'+fmtBonus(m.delta)+'</span>';
-      return `<li>${m.kind==='driver'?'Driver':'Team'}: <strong>${escapeHtml(m.name)}</strong> ${sign} — ${escapeHtml(m.reason)}</li>`;
-    });
-    sections.push(`<h4>📰 Off-season events</h4><ul>${modLines.join('')}</ul>`);
-  }
-
-  // Entry list — use preqDriverIds to determine PQ (respects season rules, not hardcoded listOrder)
+  // Entry list — from live BASE_DRIVERS (fully applied by newWeekend time)
   const preqIdsForNews=app.preqDriverIds&&app.preqDriverIds.length?app.preqDriverIds:BASE_DRIVERS.filter(d=>d.listOrder>AUTO_QUALIFY_CUTOFF_FOR_SEASON()).map(d=>d.id);
-  // Only include drivers actually contracted to a team (not Available pool)
-  const autoDriversNews=BASE_DRIVERS.filter(d=>!preqIdsForNews.includes(d.id)&&d.team&&d.team!=='Available'&&!d._retired&&!d._temp);
-  const preqDriversNews=BASE_DRIVERS.filter(d=>preqIdsForNews.includes(d.id)&&d.team&&d.team!=='Available'&&!d._retired&&!d._temp);
-  // Auto-qualifiers table grouped by team (use display name for aliases)
+  const allNewsDrivers=BASE_DRIVERS.filter(d=>d.team&&d.team!=='Available'&&!d._retired&&!d._temp);
+  const _newsDriverMap=new Map();
+  allNewsDrivers.forEach(d=>_newsDriverMap.set(d.id,d));
+  const _newsTeamCount={};
+  const _newsDriversDeduped=[..._newsDriverMap.values()].filter(d=>{
+    const max=isOneDriverTeam(d.team,year)?1:2;
+    _newsTeamCount[d.team]=(_newsTeamCount[d.team]||0)+1;
+    return _newsTeamCount[d.team]<=max;
+  });
+  const autoDriversNews=_newsDriversDeduped.filter(d=>!preqIdsForNews.includes(d.id));
+  const preqDriversNews=_newsDriversDeduped.filter(d=>preqIdsForNews.includes(d.id));
   const autoTeamNames=[...new Set(autoDriversNews.map(d=>teamDisplayName(d.team)))];
   const autoRows=autoTeamNames.map(t=>{const ds=autoDriversNews.filter(d=>teamDisplayName(d.team)===t);return`<tr><td class="left"><strong>${escapeHtml(t)}</strong></td><td class="left">${ds.map(d=>`${flagImg(d.nation2)} ${escapeHtml(driverFullName(d))}`).join('<br>')}</td></tr>`;}).join('');
   const preqTeamNamesNews=[...new Set(preqDriversNews.map(d=>teamDisplayName(d.team)))];
   const preqRows=preqTeamNamesNews.map(t=>{const ds=preqDriversNews.filter(d=>teamDisplayName(d.team)===t);return`<tr><td class="left"><strong>${escapeHtml(t)}</strong></td><td class="left">${ds.map(d=>`${flagImg(d.nation2)} ${escapeHtml(driverFullName(d))}`).join('<br>')}</td></tr>`;}).join('');
   sections.push(`<div style="display:flex;gap:16px;align-items:flex-start">
     <div style="flex:1;min-width:0"><h4>Entry list — Auto-qualifiers (${autoDriversNews.length} drivers, ${autoTeamNames.length} teams)</h4><table class="small-table" style="width:100%"><thead><tr><th>Team</th><th>Drivers</th></tr></thead><tbody>${autoRows}</tbody></table></div>
-    <div style="flex:1;min-width:0"><h4>Pre-qualifying required (${preqDriversNews.length} drivers, ${preqTeamNamesNews.length} teams)</h4><table class="small-table"><thead><tr><th>Team</th><th>Drivers</th></tr></thead><tbody>${preqRows}</tbody></table></div>
+    ${preqDriversNews.length?`<div style="flex:1;min-width:0"><h4>Pre-qualifying required (${preqDriversNews.length} drivers, ${preqTeamNamesNews.length} teams)</h4><table class="small-table"><thead><tr><th>Team</th><th>Drivers</th></tr></thead><tbody>${preqRows}</tbody></table></div>`:''}
   </div>`);
 
-  return {
+  return{
     id:'season-start-'+year,
     type:'season-start',
     year,
     title:`${year} Season Preview`,
-    html:sections.join('')
+    html:sections.join(''),
   };
 }
 
@@ -9672,6 +10288,9 @@ function SUSPENSION_CHANCE(faultId,victimIds){
 // and queue a replacement. Returns a log message string.
 function applySuspension(id,round){
   if(!app._movementRules?.suspensions)return `🚩 ${escapeHtml(BASE_DRIVERS.find(x=>x.id===id)?.name||'Driver')} — suspension (disabled by options).`;
+  // No point issuing a suspension in the final race of the season — there's no race to serve it in
+  const _totalRounds=seasonRules().totalRounds||16;
+  if(round>=_totalRounds)return '';
   if(!app.driverInjuries)app.driverInjuries={};
   app.driverInjuries[id]={impact:'Suspension',result:'1-race ban',fromRound:round,missRaces:1,career:false,cause:'suspension'};
   recordDriverIncident(id,'suspension',{gp:app.currentWeekend?.raceMeta?.gp,round});
@@ -9701,8 +10320,8 @@ function rollWeather(track){
     if(r<0.03)return 'rain';
     return 'dry';
   }
-  if(r<0.05)return 'heavy rain';
-  if(r<0.20)return 'rain';
+  if(r<0.03)return 'heavy rain';
+  if(r<0.12)return 'rain';
   return 'dry';
 }
 function weatherIcon(w){
@@ -10114,22 +10733,28 @@ function applySpunInjury(driver,round,isPreRaceSession){
     const _injTeam=driver.base.team;
     const _taken=BASE_DRIVERS.map(d=>d.id);
     const _misses=typeof inj.missRaces==='number'?inj.missRaces:16;
-    // Exclude list for a loan must only cover the borrowing team's OWN current drivers
-    // (findRivalTargetDriver searches rival teams' rosters) — using the full driver
-    // field here (as findReplacement below correctly does, since it searches the
-    // separate free-agent pool) excluded every possible candidate and made loans
-    // impossible to ever succeed.
     const _injTeamExistingIds=BASE_DRIVERS.filter(dd=>dd.team===_injTeam&&!dd._temp&&!dd._retired).map(dd=>dd.id);
     const _loaned=attemptLoanForInjuryCover(_injTeam,driver.id,_misses,_injTeamExistingIds);
     if(!app.currentWeekend._movementNews)app.currentWeekend._movementNews=[];
     if(_loaned){
       const{driver:_loanedDriver,fromTeam:_donorTeam}=_loaned;
-      app.currentWeekend._movementNews.push(`🚑 <strong>${escapeHtml(driverFullName(driver.base))}</strong> injured for ${_misses} race${_misses>1?'s':''}. <strong>${escapeHtml(driverFullName(_loanedDriver))}</strong> joins on loan from <strong>${escapeHtml(teamDisplayName(_donorTeam)||_donorTeam)}</strong> to cover at ${escapeHtml(_injTeam)}.`);
+      const _injMsg=`🚑 <strong>${escapeHtml(driverFullName(driver.base))}</strong> injured for ${_misses} race${_misses>1?'s':''}. <strong>${escapeHtml(driverFullName(_loanedDriver))}</strong> joins on loan from <strong>${escapeHtml(teamDisplayName(_donorTeam)||_donorTeam)}</strong> to cover at ${escapeHtml(_injTeam)}.`;
+      app.currentWeekend._movementNews.push(_injMsg);
+      // For pre-qualifying injuries, also log immediately so it shows in the session — post-race
+      // movement news won't appear until much later and the injury would otherwise go unannounced.
+      if(isPreRaceSession)addLog(`<span class="injury">${_injMsg}</span>`);
     } else {
       const _repl=findReplacement(_injTeam,_taken,false);
       if(_repl){
         hireReplacement(_repl,_injTeam,_misses,driver.id);
-        app.currentWeekend._movementNews.push(`🚑 <strong>${escapeHtml(driverFullName(driver.base))}</strong> injured for ${_misses} race${_misses>1?'s':''}. <strong>${escapeHtml(driverFullName(_repl))}</strong> will substitute at ${escapeHtml(_injTeam)}.`);
+        const _injMsg=`🚑 <strong>${escapeHtml(driverFullName(driver.base))}</strong> injured for ${_misses} race${_misses>1?'s':''}. <strong>${escapeHtml(driverFullName(_repl))}</strong> will substitute at ${escapeHtml(_injTeam)}.`;
+        app.currentWeekend._movementNews.push(_injMsg);
+        if(isPreRaceSession)addLog(`<span class="injury">${_injMsg}</span>`);
+      } else if(isPreRaceSession){
+        // No replacement found but still announce the injury immediately
+        const _noReplMsg=`🚑 <strong>${escapeHtml(driverFullName(driver.base))}</strong> injured for ${_misses} race${_misses>1?'s':''}. No replacement available.`;
+        app.currentWeekend._movementNews.push(_noReplMsg);
+        addLog(`<span class="injury">${_noReplMsg}</span>`);
       }
     }
   }
@@ -10301,6 +10926,7 @@ function processNextRoll(forcedDie){
         pitDramaThisRoll=true;
         applyTeamMod(driver.base.team,-0.05);
         recordMod('team',null,teamDisplayName(driver.base.team),-0.05,'Pit stop drama',w.session);
+        applyDriverTeamRelation(driver.base.id,driver.base.team,-5,'Pit stop drama');
       }
     }
   }
@@ -10331,6 +10957,7 @@ function processNextRoll(forcedDie){
     driver.pitDramaLaps.splice(driver.pitDramaLaps.indexOf(w.lap),1); // un-mark lap
     applyTeamMod(driver.base.team,0.05); // reverse team modifier
     recordMod('team',null,teamDisplayName(driver.base.team),0.05,'Pit stop drama voided (mechanical retirement)',w.session);
+    applyDriverTeamRelation(driver.base.id,driver.base.team,5,'Pit stop drama voided (mechanical retirement)');
     pitDramaThisRoll=false;
   }
   const prefix=`<span style="color:var(--muted);font-size:12px">Roll ${w.rollSequence} · Lap ${w.lap}:</span> <strong>${escapeHtml(driverSurname(driver.base))}</strong> rolled <strong>${die}</strong>.`;
@@ -10705,7 +11332,7 @@ function checkMidSeasonDNPQFirings(movementNews){
   if(!isBeforeRecalc&&!isBeforeFinale)return;
   const windowSize=isBeforeRecalc?round:(round-recalcRound);
   if(windowSize<=0)return;
-  const dnpqThreshold=Math.max(2,Math.ceil(0.4*windowSize));
+  const dnpqThreshold=Math.max(3,Math.ceil(0.55*windowSize)); // 55% rate required (vs 40% previously)
   const counts=app._seasonDNPQCountSinceRecalc||{};
   [...(app.preqDriverIds||[])].forEach(id=>{
     const d=BASE_DRIVERS.find(x=>x.id===id);
@@ -10717,6 +11344,10 @@ function checkMidSeasonDNPQFirings(movementNews){
     if(roundsSinceTeamJoin(id,d.team,round)<2)return;
     const dnpqCount=counts[id]||0;
     if(dnpqCount<dnpqThreshold)return;
+    // Skip a driver who PASSED pre-qualifying this very race — they showed up today, firing
+    // them for historical DNPQs on the same day they qualified is contradictory (Ghinzani case).
+    const _passedPQThisRace=(w._pqAdvancerIds||[]).includes(id);
+    if(_passedPQThisRace)return;
     // Scale directly off the same formula used for the end-of-season DNPQ firing check,
     // rather than an independent formula. Each boundary now gets checked at two rounds
     // instead of one, so the per-checkpoint multiplier is reduced (p = 1-sqrt(1-T)) so the
@@ -10730,7 +11361,7 @@ function checkMidSeasonDNPQFirings(movementNews){
     const name=driverFullName(d);
     const nation2=d.nation2;
     releaseDriverFromTeam(d,'fired');
-    recordDriverIncident(id,'teamChange',{action:'fired',fromTeam:team,round,year:app.currentSeason,reason:'poor-qualifying'});
+    recordDriverIncident(id,'teamChange',{action:'fired',fromTeam:team,round,year:app.currentSeason,reason:'reckless-driving'});
     recordDriverMovement(id,'fired',team,null,`Too many DNPQs (${dnpqCount} of ${windowSize} rounds since ${isBeforeRecalc?'start of season':'recalc'})`,round,app.currentSeason,name);
     let repl;
     if(!isBeforeRecalc){
@@ -10749,7 +11380,7 @@ function checkMidSeasonDNPQFirings(movementNews){
     // export and a few specific news sections (rivalry, contract returns) that explicitly
     // filter out firings/hires to avoid double-displaying them here.
     if(!w._firedNews)w._firedNews=[];
-    const _firedEntry={action:'fired',reason:'poor-qualifying',nation2,originalName:name,team};
+    const _firedEntry={action:'fired',reason:'reckless-driving',nation2,originalName:name,team};
     if(repl){
       hireReplacement(repl,team,999,null);
       _firedEntry.replacementName=driverFullName(repl);
@@ -11660,7 +12291,6 @@ function renderWeekend(){
       <select id="speedSelect"><option value="1400">Slow</option><option value="800" selected>Med</option><option value="350">Fast</option></select>
       <button class="ghost" onclick="instantLapWrapper()" ${w.weekendFinished?'disabled':''} title="Shortcut: I">Instant lap <span style="font-size:10px;opacity:.6">(i)</span></button>
       <button class="ghost" onclick="instantResult()" ${w.weekendFinished||w.pendingSeasonReturn?'disabled':''}>Instant session <span style="font-size:10px;opacity:.6">(s)</span></button>
-      <button class="ghost" onclick="saveWeekend()">Save</button>
       <button class="ghost" onclick="goHash('#season-'+(app.currentSeason||1989))">Season</button>
       ${w.weekendFinished&&w.session==='race'?`<button class="ghost" onclick="exportRollLog()" style="font-size:11px">📋 Export roll log</button><button class="ghost" onclick="exportModifierLog()" style="font-size:11px">📊 Export modifier log</button>`:''}
     </div>
@@ -12100,7 +12730,7 @@ function renderProfile(hash){
       <div class="metric"><div class="label">Modifier</div><div class="value"><span class="${cls}">${fmtBonus(mod)}</span></div></div>
       ${formBox}
       ${(()=>{
-        const sorted=c.races.filter(e=>e.race||e.quali).sort((a,b)=>a.meta.year-b.meta.year||a.meta.round-b.meta.round);
+        const sorted=c.races.filter(e=>e.race||e.quali||e.preq).sort((a,b)=>a.meta.year-b.meta.year||a.meta.round-b.meta.round);
         if(!sorted.length)return'';
         const first=sorted[0],last=sorted[sorted.length-1];
         const fmtR=e=>`R${e.meta.round} ${e.meta.year} — ${escapeHtml((e.meta.gp||'').replace(/ Grand Prix$/,''))}`;
@@ -12279,19 +12909,25 @@ function renderProfile(hash){
           const toTeam=inc.details?.team||'?';
           const joinYr=yr;
           const joinRd=inc.details?.round||0;
-          // 'after R{X}' means X is the last round BEFORE their debut — joinRd stores
-          // their actual debut round, so the displayed number is one less.
-          const joinRdDisplay=Math.max(1,joinRd-1);
           const toTeamDisplay=teamDisplayName(toTeam,joinYr)||toTeam;
           const isInjRep=inc.details?.isInjuryReplacement;
           const isSuspRep=inc.details?.isSuspensionReplacement;
           const repNote=isInjRep?' (injury replacement)':isSuspRep?' (suspension replacement)':'';
           const isPermanentMidSeasonSigning=joinRd>0&&!isInjRep&&!isSuspRep;
+          // Suppress 'Joined X at start of season' if driver was already at X the prior year
+          // (re-signs produce a new teamJoin incident but showing it every year is repetitive)
           if(joinRd===0){
-            milestoneLog.push({sort:`${joinYr}-00-j`,year:joinYr,icon:'🤝',text:`Joined ${escapeHtml(toTeamDisplay)} at start of season${repNote}`});
+            const _prevYrJoin=(app.driverIncidents?.[id]||[]).find(x=>
+              x.type==='teamJoin'&&(x.details?.year||0)===(joinYr-1)&&teamCanonicalName(x.details?.team||'')===teamCanonicalName(toTeam));
+            if(!_prevYrJoin){
+              milestoneLog.push({sort:`${joinYr}-00-j`,year:joinYr,icon:'🤝',text:`Joined ${escapeHtml(toTeamDisplay)} at start of season${repNote}`});
+            }
           } else if(isPermanentMidSeasonSigning){
+            // 'after R{X}' means X is the last round BEFORE their debut — joinRd stores actual debut round
+            const joinRdDisplay=Math.max(1,joinRd-1);
             milestoneLog.push({sort:`${joinYr}-${String(joinRd).padStart(2,'0')}-j`,year:joinYr,icon:'🤝',text:`Signed by ${escapeHtml(toTeamDisplay)} after ${gpFmt('',joinRdDisplay)}`});
           } else {
+            const joinRdDisplay=Math.max(1,joinRd-1);
             milestoneLog.push({sort:`${joinYr}-${String(joinRd).padStart(2,'0')}-j`,year:joinYr,icon:'🤝',text:`Joined ${escapeHtml(toTeamDisplay)} after ${gpFmt('',joinRdDisplay)}${repNote}`});
           }
         } else if(inc.type==='loaned'){
@@ -12686,7 +13322,7 @@ function renderEncyclopedia(){
       <h3><a class="profile-link" href="#circuits" onclick="event.preventDefault();goHash('#circuits')" style="font-size:inherit;font-weight:inherit">🏁 Circuits</a></h3>
       <h3>Seasons</h3>
       <table class="small-table" style="width:100%"><thead><tr><th>Year</th><th>Drivers' Champion</th><th>Constructors' Champion</th></tr></thead><tbody>
-      ${seasons.map(y=>{const _yWeeks=app.history.weekends.filter(w=>w.raceMeta.year===y);const _complete=_yWeeks.length>0;const _st=_complete?seasonStandings(y):{drivers:[],teams:[],driverChampion:null,teamChampion:null};const _dc=_complete?(_st.driverChampion||(_st.drivers[0]?(_st.drivers[0].id?(()=>{const _bd=BASE_DRIVERS.find(d=>d.id===_st.drivers[0].id)||(app._retiredDrivers||[]).find(r=>r.id===_st.drivers[0].id);return _bd?(driverFullName(_bd)||_bd.name||''):_st.drivers[0].name;})():_st.drivers[0].name):'—')):'—';const _cc_name=_complete?(_st.teamChampion||_st.teams[0]?.name||null):null;const _cc_link=_cc_name?(teamLink(_cc_name,escapeHtml(teamDisplayName(_cc_name)),true)):null;const _cc=_cc_name?(_cc_link||escapeHtml(teamDisplayName(_cc_name))):'—';return _complete?`<tr><td><a class="profile-link" href="#season-${y}" onclick="event.preventDefault();goHash('#season-${y}')">${y}</a></td><td>${escapeHtml(_dc)}</td><td>${_cc}</td></tr>`:`<tr><td><a class="profile-link" href="#season-${y}" onclick="event.preventDefault();goHash('#season-${y}')">${y}</a></td><td colspan="2" class="subtle">In progress</td></tr>`;}).join('')}
+      ${seasons.map(y=>{const _yWeeks=app.history.weekends.filter(w=>w.raceMeta.year===y);const _complete=_yWeeks.length>0;const _st=_complete?seasonStandings(y):{drivers:[],teams:[],driverChampion:null,teamChampion:null};const _dcDriver=_complete?_st.drivers[0]:null;const _dcId=_dcDriver?.id||null;const _dcName=_complete?(_st.driverChampion||(_dcDriver?(()=>{const _bd=BASE_DRIVERS.find(d=>d.id===_dcId)||(app._retiredDrivers||[]).find(r=>r.id===_dcId);return _bd?(driverFullName(_bd)||_bd.name||''):_dcDriver.name;})():'—')):'—';const _dcHtml=_dcId?driverLink(_dcId,escapeHtml(_dcName),true):escapeHtml(_dcName);const _cc_name=_complete?(_st.teamChampion||_st.teams[0]?.name||null):null;const _cc_link=_cc_name?(teamLink(_cc_name,escapeHtml(teamDisplayName(_cc_name)),true)):null;const _cc=_cc_name?(_cc_link||escapeHtml(teamDisplayName(_cc_name))):'—';return _complete?`<tr><td><a class="profile-link" href="#season-${y}" onclick="event.preventDefault();goHash('#season-${y}')">${y}</a></td><td>${_dcHtml}</td><td>${_cc}</td></tr>`:`<tr><td><a class="profile-link" href="#season-${y}" onclick="event.preventDefault();goHash('#season-${y}')">${y}</a></td><td colspan="2" class="subtle">In progress</td></tr>`;}).join('')}
       </tbody></table>
 
   </div></div>`;
@@ -13167,6 +13803,8 @@ function renderOptions(){
   <button class="ghost" onclick="debugMoveDriver()" style="text-align:left">↔ Move driver between teams</button>
   <button class="ghost" onclick="debugRemoveDriver()" style="text-align:left">🚪 Remove driver and replace with free agent</button>
   <button class="ghost" onclick="debugDumpDriverHistory()" style="text-align:left">🔍 Dump driver weekend history (find duplicate records)</button>
+  <button class="ghost" onclick="exportEOSLog()" style="text-align:left">📋 Export EOS period log (diagnose signing issues)</button>
+  <button class="ghost" onclick="exportWeatherLog()" style="text-align:left">🌦 Export weather log (check wet race frequencies)</button>
   <button class="ghost" onclick="debugCreateInjury()" style="text-align:left">🚑 Create driver injury or suspension</button>
   <button class="ghost" onclick="debugNonChampRace()" style="text-align:left">🏁 Run non-championship race</button>
   <button class="ghost" onclick="exportModifierLog()" style="text-align:left">📊 Export modifier change log (all seasons)</button>
@@ -13561,6 +14199,73 @@ function debugConfirmMoveDriver(){
 window.debugMoveDriver=debugMoveDriver;
 window.debugConfirmMoveDriver=debugConfirmMoveDriver;
 
+function exportEOSLog(){
+  const eos=app._eos||app._lastEos;
+  if(!eos){alert('No EOS data found — run the end of season wizard first.');return;}
+  const lines=[];
+  const hdr=s=>{lines.push('');lines.push('═'.repeat(60));lines.push(s);lines.push('═'.repeat(60));};
+  const sub=s=>{lines.push('');lines.push('─ '+s+' '+'─'.repeat(Math.max(0,58-s.length)));};
+
+  lines.push(`F1Dice EOS Export — ${eos.year||'?'} → ${eos.nextYear||'?'}`);
+  lines.push(`Exported: ${new Date().toLocaleString()}`);
+
+  hdr('PROCESS LOG (chronological)');
+  [...(eos.processLog||[])].reverse().forEach(e=>lines.push(e));
+
+  hdr('SIGNING DEBUG LOG');
+  (eos._signingDebugLog||[]).forEach(e=>lines.push(e));
+
+  hdr('MOVEMENTS (approved)');
+  (eos.movements||[]).filter(m=>m.approved!==false).forEach(m=>{
+    const d=driverFullName(m.d)||m.d?.name||'?';
+    lines.push(`  ${m.type.toUpperCase()} ${d} | ${teamDisplayName(m.from||'?')} → ${m.to?teamDisplayName(m.to):'FA'} | ${m.reason||''}`);
+  });
+
+  hdr('SIGNINGS');
+  (eos.signings||[]).forEach(s=>{
+    const d=((s.driver.firstName||s.driver.fn||'')+' '+(s.driver.lastName||s.driver.ln||s.driver.name||'')).trim();
+    const dMod=(s.driver.driverBonus||s.driver.db||0)+(getDriverMod(s.driver.id)||0);
+    const tag=s._skipped?'SKIPPED':s._isOwnDriver?'RE-SIGNED':s._isRecruit?'RECRUIT':'SIGNED';
+    const donorStr=s._isRecruit?` (from ${teamDisplayName(s._donorTeam)})`:'';
+    lines.push(`  [${tag}] ${teamDisplayName(s.team)} ← ${d} ${(dMod>=0?'+':'')+dMod.toFixed(2)}${donorStr} | ${s.reason||''}`);
+  });
+
+  hdr('UNSIGNED POOL (end of signing period)');
+  (eos._unsignedPool||[]).forEach(f=>{
+    const d=((f.firstName||f.fn||'')+' '+(f.lastName||f.ln||f.name||'')).trim();
+    const dMod=(f.driverBonus||f.db||0)+(getDriverMod(f.id)||0);
+    lines.push(`  ${d} ${(dMod>=0?'+':'')+dMod.toFixed(2)}`);
+  });
+
+  hdr('FINAL ROSTER (by team, from eos.signings)');
+  const byTeam={};
+  (eos.signings||[]).forEach(s=>{
+    if(!byTeam[s.team])byTeam[s.team]=[];
+    byTeam[s.team].push(s);
+  });
+  Object.entries(byTeam).sort((a,b)=>a[0].localeCompare(b[0])).forEach(([team,ss])=>{
+    const maxS=isOneDriverTeam(team,eos.nextYear)?1:2;
+    const over=ss.length>maxS?' ⚠ OVER CAP':'';
+    const short=ss.length<maxS?' ⚠ SHORT':'';
+    lines.push(`  ${teamDisplayName(team)} (${ss.length}/${maxS})${over}${short}`);
+    ss.forEach(s=>{
+      const d=((s.driver.firstName||s.driver.fn||'')+' '+(s.driver.lastName||s.driver.ln||s.driver.name||'')).trim();
+      const tag=s._isOwnDriver?'re-sign':s._isRecruit?'recruit':'new';
+      lines.push(`    [${tag}] ${d}`);
+    });
+  });
+
+  hdr('RETIREMENTS');
+  (eos.retirements||[]).forEach(r=>{
+    const d=driverFullName(r.d)||r.d?.name||'?';
+    lines.push(`  ${r.forced?'FORCED':'VOLUNTARY'} | ${d} | ${r.reason||''}`);
+  });
+
+  const blob=new Blob([lines.join('\n')],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=`F1Dice_EOS_Log_${eos.year||'?'}.txt`;a.click();
+}
+window.exportEOSLog=exportEOSLog;
 function debugDumpDriverHistory(){
   const existing=document.getElementById('debugHistDumpModal');if(existing)existing.remove();
   const modal=document.createElement('div');modal.id='debugHistDumpModal';
@@ -14187,7 +14892,37 @@ function exportRelationshipLog(){
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
   a.download=`F1Dice_RelationshipLog_${app.currentSeason||1989}.txt`;a.click();
 }
-window.exportRelationshipLog=exportRelationshipLog;
+function exportWeatherLog(){
+  const lines=['Season,Round,GP,Track,Weather'];
+  app.history.weekends.forEach(w=>{
+    if(!w.raceMeta||!w.race?.length)return; // skip non-race weekends
+    const yr=w.raceMeta.year||'?';
+    const rd=w.raceMeta.round||'?';
+    const gp=w.raceMeta.gp||'';
+    const track=w.raceMeta.track||'';
+    const weather=w.raceMeta.weather||'dry';
+    lines.push([yr,rd,`"${gp}"`,`"${track}"`,weather].join(','));
+  });
+  // Summary counts
+  lines.push('');
+  lines.push('=== Summary ===');
+  const total=lines.length-4; // subtract headers and blank/summary
+  const races=app.history.weekends.filter(w=>w.race?.length).length;
+  const byWeather={dry:0,rain:0,'heavy rain':0};
+  app.history.weekends.filter(w=>w.race?.length).forEach(w=>{
+    const wth=w.raceMeta?.weather||'dry';
+    byWeather[wth]=(byWeather[wth]||0)+1;
+  });
+  lines.push(`Total races: ${races}`);
+  lines.push(`Dry: ${byWeather.dry} (${(byWeather.dry/races*100).toFixed(1)}%)`);
+  lines.push(`Rain: ${byWeather.rain} (${(byWeather.rain/races*100).toFixed(1)}%)`);
+  lines.push(`Heavy Rain: ${byWeather['heavy rain']} (${(byWeather['heavy rain']/races*100).toFixed(1)}%)`);
+  lines.push(`Any wet: ${byWeather.rain+byWeather['heavy rain']} (${((byWeather.rain+byWeather['heavy rain'])/races*100).toFixed(1)}%)`);
+  const blob=new Blob([lines.join('\n')],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=`F1Dice_Weather_Log.csv`;a.click();
+}
+window.exportWeatherLog=exportWeatherLog;
 function exportRelationshipLogFiltered(entityType,entityId){
   const rel=app.driverTeamRelations||{};
   const lines=[
@@ -14644,6 +15379,9 @@ function getMovementExplanation(movement){
     'fired/very-poor-form':'Driver was fired following a prolonged loss of form.',
     'fired/rivalry':'Driver was fired following teammate rivalry conflict.',
     'fired/performance':'Driver was fired due to poor overall performance.',
+    'retired/End of career':'Driver retired from motorsport.',
+    'retired/Career-ending injury':'Driver retired due to a career-ending injury.',
+    'retired/Age 44 — mandatory retirement':'Driver reached mandatory retirement age.',
     'quit/personal':'Driver voluntarily quit their team to pursue other opportunities.',
     'quit/rivalry':'Driver quit due to a hatred-level rivalry with their teammate.',
     'quit/car-reliability-frustration':'Driver quit out of frustration after repeated mechanical failures cost them a competitive season.',
@@ -14992,9 +15730,9 @@ document.addEventListener('keydown',e=>{
     if(e.key==='i'||e.key==='I'){e.preventDefault();instantLapWrapper();return;}
     if(e.key==='s'||e.key==='S'){e.preventDefault();instantResult();return;}
   }
-  // 'S' also starts the next round when no weekend is currently in progress — matches the
-  // 'Start next round' button on the home page and season page.
-  if((e.key==='s'||e.key==='S')&&(!w||w.weekendFinished)&&!app._eos&&currentSeasonEntries().length<seasonRules().totalRounds){
+  // 'S' starts the next round from home, season, or finished weekend pages
+  const _onSeasonPage=window.location.hash.startsWith('#season-')||window.location.hash==='#start'||window.location.hash==='#weekend';
+  if((e.key==='s'||e.key==='S')&&_onSeasonPage&&!_inActiveWeekend&&!app._eos&&currentSeasonEntries().length<seasonRules().totalRounds){
     e.preventDefault();newWeekend();
   }
 });
