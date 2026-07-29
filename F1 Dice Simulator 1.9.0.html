@@ -144,6 +144,7 @@ function resetSeasonScopedTrackers(){
   // reduced last year's form to a small fraction of its original weight.)
   app._seasonNoPointsStreak={};
   app._seasonSpunOffCount={};
+  app._seasonSpunOffWeighted={};
   app._vacatedPQTeams={};
   app._seasonDNPQCount={};
   app._seasonDNPQCountSinceRecalc={};
@@ -4390,7 +4391,7 @@ function evaluateAndFireDrivers(raceResults, newsItems){
     if(rivalFire) specificReason='rivalry';
     else if(seasonCrashFaultsForLabel+((app._seasonSpunOffCount||{})[d.id]||0)*0.5>=2) specificReason='reckless-driving';
     else if(dnqThisRace&&dnqCount===1) specificReason='poor-qualifying'; // single DNQ this race — 'failed to qualify'
-    else if(dnqCount>=2) specificReason='reckless-driving'; // multiple DNQs → 'performance issues' (reuses reckless-driving map key for 'performance issues')
+    else if(dnqCount>=2) specificReason='performance-issues'; // multiple DNQs — its own key, no longer sharing 'reckless-driving'
 
     if(Math.random()<fireChance){
       toProcess.push({id:d.id,team:d.team,reason:rivalFire?'rivalry':specificReason,action:'fired'});
@@ -7175,14 +7176,26 @@ function eosComputePhase3Releases(){
         releasedInPhase1.add(d.id);return;
       }
     }
-    // Crash firing: requires ≥2 at-fault crashes; sliding scale by modifier
+    // Crash/spin-off firing ('reckless driving'): requires a blended total of ≥2 — at-fault
+    // crashes count fully, spin-offs count at a weather-weighted fraction (75% dry / 50%
+    // rain / 25% heavy rain, reflecting that losing the car is far more excusable the worse
+    // conditions get). Sliding probability scale by modifier — fully immune from +2.00 up.
     const crashFaultCount=(app._seasonCrashFaultCount||{})[d.id]||0;
-    if(_establishedForRelease&&crashFaultCount>=2&&!releasedInPhase1.has(d.id)){
+    const spunOffWeightedCount=(app._seasonSpunOffWeighted||{})[d.id]||0;
+    const blendedCrashTotal=crashFaultCount+spunOffWeightedCount;
+    if(_establishedForRelease&&blendedCrashTotal>=2&&!releasedInPhase1.has(d.id)){
       let crashFireProb=0;
-      if(dtm>=-5&&dtm<-3)crashFireProb=Math.min(0.70,crashFaultCount*0.30);
-      else if(dtm>=-3&&dtm<-1)crashFireProb=Math.min(0.45,crashFaultCount*0.20);
+      if(dtm>=-5&&dtm<-3)crashFireProb=Math.min(0.70,blendedCrashTotal*0.30);
+      else if(dtm>=-3&&dtm<-1)crashFireProb=Math.min(0.45,blendedCrashTotal*0.20);
+      else if(dtm>=-1&&dtm<1.00)crashFireProb=Math.min(0.25,blendedCrashTotal*0.10);
+      else if(dtm>=1.00&&dtm<2.00)crashFireProb=Math.min(0.15,blendedCrashTotal*0.05);
+      // dtm>=2.00: no branch matches, crashFireProb stays 0 — fully immune regardless of
+      // incident count.
       if(crashFireProb>0&&Math.random()<crashFireProb){
-        items.push({d,from:d.team,to:null,type:'release',approved:null,reason:`At fault in ${crashFaultCount} crashes this season`,_firedForCrash:true});
+        const _incidentParts=[];
+        if(crashFaultCount>0)_incidentParts.push(`${crashFaultCount} crash${crashFaultCount===1?'':'es'}`);
+        if(spunOffWeightedCount>0)_incidentParts.push(`${spunOffWeightedCount.toFixed(2)} weighted spin-off score`);
+        items.push({d,from:d.team,to:null,type:'release',approved:null,reason:`Reckless driving — at fault in ${_incidentParts.join(' + ')} this season`,_firedForCrash:true});
         releasedInPhase1.add(d.id);return;
       }
     }
@@ -11117,7 +11130,7 @@ function raceNewsTeamChanges(weekendEntry,round){
     weekendEntry._firedNews.forEach(f=>{
       const isQuit=f.action==='quit';
       const actionLabel=isQuit?'quits!':'fired!';
-      const _reasonMap={'rivalry':'rivalry','poor-qualifying':'failed to qualify','reckless-driving':'performance issues','paddock-drama':'paddock drama','underperforming-teammate':'outperformed by teammate','teammate-frustration':'outperformed by teammate','top-team-underperformance':'underperforming a top team','very-poor-form':'poor form','car-reliability-frustration':'car reliability frustration'};
+      const _reasonMap={'rivalry':'rivalry','poor-qualifying':'failed to qualify','reckless-driving':'performance issues','performance-issues':'performance issues','paddock-drama':'paddock drama','underperforming-teammate':'outperformed by teammate','teammate-frustration':'outperformed by teammate','top-team-underperformance':'underperforming a top team','very-poor-form':'poor form','car-reliability-frustration':'car reliability frustration'};
       const _baseReason=f.reason&&f.reason!=='personal'?(_reasonMap[f.reason]||f.reason):'';
       const _rivalSuffix=(f.reason==='rivalry'&&f.rivalTeammateName)?` with ${escapeHtml(f.rivalTeammateName)}`:'';
       const reasonLabel=_baseReason?` (${_baseReason}${_rivalSuffix})`:'';
@@ -12343,6 +12356,17 @@ function markRetired(d,lap,roll,die){
   if(d.retirementReason===SPUN_OFF){
     if(!app._seasonSpunOffCount)app._seasonSpunOffCount={};
     app._seasonSpunOffCount[d.id]=(app._seasonSpunOffCount[d.id]||0)+1;
+    // Weather-weighted spin-off tracking, race sessions only (matches the crash-fault
+    // mechanism's own scope) — a dry-weather spin-off is a stronger 'car control' signal
+    // than one in the wet, where losing the car is far more understandable. Kept separate
+    // from the flat count above, which the existing firing-reason labeling logic already
+    // uses with its own 0.5x weighting — this is purely for the blended release check.
+    if(app.currentWeekend.session==='race'){
+      const _weatherAtSpin=app.currentWeekend.raceMeta?.weather||'dry';
+      const _spinWeight=_weatherAtSpin==='heavy rain'?0.25:_weatherAtSpin==='rain'?0.50:0.75;
+      if(!app._seasonSpunOffWeighted)app._seasonSpunOffWeighted={};
+      app._seasonSpunOffWeighted[d.id]=(app._seasonSpunOffWeighted[d.id]||0)+_spinWeight;
+    }
   }
   d.incidentLap=lap;d.incidentRoll=roll;d.laps[lap-1]='X';
   // In qualifying/pre-qualifying, void the retirement lap score entirely (deduct the full roll)
@@ -13234,7 +13258,7 @@ function checkMidSeasonDNPQFirings(movementNews){
     const name=driverFullName(d);
     const nation2=d.nation2;
     releaseDriverFromTeam(d,'fired');
-    recordDriverIncident(id,'teamChange',{action:'fired',fromTeam:team,round,year:app.currentSeason,reason:'reckless-driving'});
+    recordDriverIncident(id,'teamChange',{action:'fired',fromTeam:team,round,year:app.currentSeason,reason:'performance-issues'});
     recordDriverMovement(id,'fired',team,null,`Too many DNPQs (${dnpqCount} of ${windowSize} rounds since ${isBeforeRecalc?'start of season':'recalc'})`,round,app.currentSeason,name);
     let repl;
     if(!isBeforeRecalc){
@@ -13253,7 +13277,7 @@ function checkMidSeasonDNPQFirings(movementNews){
     // export and a few specific news sections (rivalry, contract returns) that explicitly
     // filter out firings/hires to avoid double-displaying them here.
     if(!w._firedNews)w._firedNews=[];
-    const _firedEntry={action:'fired',reason:'reckless-driving',nation2,originalName:name,team};
+    const _firedEntry={action:'fired',reason:'performance-issues',nation2,originalName:name,team};
     if(repl){
       hireReplacement(repl,team,999,null);
       _firedEntry.replacementName=driverFullName(repl);
@@ -14822,7 +14846,7 @@ function renderProfile(hash){
           const dur=Number(miss)>1?`${miss} races`:`1 race`;
           milestoneLog.push({sort:sortKey,year:yr,icon:'🚩',text:`Suspended (${dur}) — ${gpStr}`});
         } else if(inc.type==='teamChange'){
-          const _fireReasonMap={rivalry:'rivalry',['poor-qualifying']:'failed to qualify',['reckless-driving']:'performance issues',['paddock-drama']:'paddock drama',['underperforming-teammate']:'outperformed by teammate',['teammate-frustration']:'outperformed by teammate',['top-team-underperformance']:'underperforming a top team',['very-poor-form']:'poor form',['car-reliability-frustration']:'car reliability frustration'};
+          const _fireReasonMap={rivalry:'rivalry',['poor-qualifying']:'failed to qualify',['reckless-driving']:'performance issues',['performance-issues']:'performance issues',['paddock-drama']:'paddock drama',['underperforming-teammate']:'outperformed by teammate',['teammate-frustration']:'outperformed by teammate',['top-team-underperformance']:'underperforming a top team',['very-poor-form']:'poor form',['car-reliability-frustration']:'car reliability frustration'};
           const isClosed=inc.details?.action==='teamClosed';
           const actionWord=inc.details?.action==='fired'?'Fired by':inc.details?.action==='quit'?'Quit':isClosed?'Left':'Left';
           const fromTeam=inc.details?.fromTeam||'?';
@@ -17652,7 +17676,8 @@ function getMovementExplanation(movement){
     'hired/temporary-cover':'Driver was hired to cover for a suspension or brief absence.',
     'fired/rivalry':'Driver was fired due to intense rivalry with their teammate.',
     'fired/poor-qualifying':'Driver was fired after failing to qualify.',
-    'fired/reckless-driving':'Driver was fired due to multiple at-fault crashes.',
+    'fired/reckless-driving':'Driver was fired due to multiple at-fault crashes and/or spin-offs.',
+    'fired/performance-issues':'Driver was fired after repeatedly failing to (pre-)qualify.',
     'fired/paddock-drama':'Driver was fired following paddock controversy.',
     'fired/very-poor-form':'Driver was fired due to poor form.',
     'fired/rivalry':'Driver was fired following teammate rivalry conflict.',
